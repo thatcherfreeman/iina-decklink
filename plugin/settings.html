@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>DeckLink Output</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --fg: #1d1d1f;
+        --fg-dim: rgba(0, 0, 0, 0.55);
+        --bg: #ececec;
+        --panel: #fbfbfd;
+        --border: rgba(0, 0, 0, 0.14);
+        --accent: #0a6cff;
+        --warn: #b25000;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --fg: #f2f2f7;
+          --fg-dim: rgba(255, 255, 255, 0.55);
+          --bg: #232326;
+          --panel: #2c2c30;
+          --border: rgba(255, 255, 255, 0.16);
+          --accent: #4d9bff;
+          --warn: #ffab5e;
+        }
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        padding: 16px;
+        background: var(--bg);
+        color: var(--fg);
+        font: 13px -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+      }
+      h2 {
+        font-size: 11px;
+        font-weight: 600;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        color: var(--fg-dim);
+        margin: 0 0 8px;
+      }
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 12px 14px;
+        margin-bottom: 14px;
+      }
+      .row {
+        display: grid;
+        grid-template-columns: 150px 1fr;
+        align-items: center;
+        gap: 10px;
+        margin-bottom: 9px;
+      }
+      .row:last-child { margin-bottom: 0; }
+      label.name { text-align: right; color: var(--fg-dim); }
+      select, input[type="text"], input[type="number"] {
+        width: 100%;
+        padding: 4px 6px;
+        font: inherit;
+        color: var(--fg);
+        background: transparent;
+        border: 1px solid var(--border);
+        border-radius: 5px;
+      }
+      input[type="number"] { max-width: 90px; }
+      .checkline { display: flex; align-items: center; gap: 6px; }
+      .hint {
+        grid-column: 2;
+        margin: -4px 0 8px;
+        font-size: 11px;
+        color: var(--fg-dim);
+      }
+      .status {
+        padding: 8px 10px;
+        border-radius: 6px;
+        margin-bottom: 14px;
+        font-size: 12px;
+        border: 1px solid var(--border);
+      }
+      .status.warn { color: var(--warn); }
+      footer {
+        display: flex;
+        justify-content: flex-end;
+        gap: 8px;
+        align-items: center;
+      }
+      button {
+        font: inherit;
+        padding: 5px 14px;
+        border-radius: 6px;
+        border: 1px solid var(--border);
+        background: var(--panel);
+        color: var(--fg);
+      }
+      button.primary {
+        background: var(--accent);
+        border-color: transparent;
+        color: #fff;
+        font-weight: 500;
+      }
+      button:active { opacity: 0.7; }
+      .spacer { flex: 1; }
+    </style>
+  </head>
+  <body>
+    <div id="status" class="status">Looking for DeckLink devices…</div>
+
+    <div id="helperPanel" class="panel" style="display: none">
+      <h2>Helper</h2>
+      <p id="helperText" style="margin: 0 0 10px">
+        The helper isn't installed yet. It's a small signed binary that owns
+        the DeckLink device and decodes alongside IINA.
+      </p>
+      <button id="download" class="primary">Download helper</button>
+    </div>
+
+    <div class="panel">
+      <h2>Device</h2>
+      <div class="row">
+        <label class="name" for="device">Device</label>
+        <select id="device"></select>
+      </div>
+      <div class="row">
+        <label class="name" for="lockResolution">Resolution</label>
+        <select id="lockResolution">
+          <option value="">Scanning…</option>
+        </select>
+      </div>
+      <div class="hint">
+        Set this to what your monitor expects. The picture is scaled to fit it,
+        and only the frame rate is negotiated against the source — so a 1080p
+        film on a UHD monitor is upscaled rather than switching the monitor's
+        mode. The list is what this device actually reports.
+      </div>
+      <div class="row">
+        <label class="name" for="link">SDI link</label>
+        <select id="link"></select>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Signal</h2>
+      <div class="row">
+        <label class="name" for="pixfmt">Pixel format</label>
+        <select id="pixfmt"></select>
+      </div>
+      <div class="row">
+        <label class="name" for="levels">Levels</label>
+        <select id="levels"></select>
+      </div>
+      <div class="row">
+        <label class="name" for="framing">Framing</label>
+        <select id="framing"></select>
+      </div>
+      <div class="hint">
+        1:1 sends the source at its native size with no resampling, cropping or
+        padding to fit the canvas.
+      </div>
+      <div class="row">
+        <label class="name" for="audio">Embedded audio</label>
+        <div class="checkline">
+          <input type="checkbox" id="audio" />
+          <select id="audioChannels" style="max-width: 110px">
+            <option value="2">2 channels</option>
+            <option value="8">8 channels</option>
+            <option value="16">16 channels</option>
+          </select>
+        </div>
+      </div>
+      <div class="hint">
+        The source track is resampled to 48 kHz and mixed to this many
+        channels. IINA keeps playing its own audio regardless; this is a
+        separate feed for the monitor. Muted while paused, and while playing at
+        anything other than 1×.
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Timing &amp; decoding</h2>
+      <div class="row">
+        <label class="name" for="offsetMs">Output offset</label>
+        <div class="checkline">
+          <input type="number" id="offsetMs" step="1" min="-2000" max="2000" />
+          <span style="color: var(--fg-dim)">ms</span>
+        </div>
+      </div>
+      <div class="hint">
+        Positive values send the picture later. Use this to line the reference
+        monitor up against IINA's own audio.
+      </div>
+      <div class="row">
+        <label class="name" for="preroll">Preroll</label>
+        <div class="checkline">
+          <input type="number" id="preroll" step="1" min="1" max="16" />
+          <span style="color: var(--fg-dim)">frames</span>
+        </div>
+      </div>
+      <div class="row">
+        <label class="name" for="hwdec">Hardware decoding</label>
+        <select id="hwdec"></select>
+      </div>
+      <div class="hint">
+        VideoToolbox can't handle 4:4:4 or 12-bit; those fall back to software
+        automatically.
+      </div>
+      <div class="row">
+        <label class="name" for="onBlur">When not frontmost</label>
+        <select id="onBlur"></select>
+      </div>
+      <div class="hint">
+        Blank to black keeps the card so it comes back instantly, without
+        leaving a frozen frame on the monitor while you're away. Release hands
+        the card to another application instead — Resolve, say.
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Still capture</h2>
+      <div class="row">
+        <label class="name">Save to</label>
+        <div class="checkline">
+          <span id="stillDir" style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1">—</span>
+          <button id="stillDirReveal" type="button">Reveal</button>
+          <button id="stillDirChoose" type="button">Choose…</button>
+        </div>
+      </div>
+      <div class="hint">
+        Plugin → Grab Still (or press I) saves the frame currently on the
+        DeckLink output as a 16-bit TIFF, named from the title and timestamp.
+        Playback pauses for the moment it takes to write it.
+      </div>
+    </div>
+
+    <footer>
+      <button id="refresh">Rescan devices</button>
+      <div class="spacer"></div>
+      <button id="apply" class="primary">Apply</button>
+    </footer>
+
+    <script>
+      // A script error in here otherwise produces nothing but a window stuck
+      // on its placeholder text, with no trace anywhere: the webview has no
+      // console the plugin can read.  Report it up before doing anything else.
+      window.addEventListener("error", (e) => {
+        iina.postMessage("pageerror", {
+          message: String(e.message),
+          line: e.lineno,
+          column: e.colno,
+        });
+      });
+
+      const $ = (id) => document.getElementById(id);
+      let settings = null;
+
+      function fillSelect(el, options, value) {
+        el.innerHTML = "";
+        for (const option of options) {
+          const node = document.createElement("option");
+          node.value = option.value;
+          node.textContent = option.label;
+          el.appendChild(node);
+        }
+        if (value !== undefined) el.value = value;
+        // Assigning a value the list doesn't contain leaves the control blank
+        // rather than erroring — which is how a saved resolution the device no
+        // longer offers would silently become "no selection".
+        if (el.selectedIndex < 0) el.selectedIndex = 0;
+      }
+
+      iina.onMessage("settings", (data) => {
+        settings = data.settings;
+        const o = data.options;
+        fillSelect($("pixfmt"), o.pixelFormats, settings.pixfmt);
+        fillSelect($("levels"), o.levels, settings.levels);
+        fillSelect($("link"), o.linkModes, settings.link);
+        fillSelect($("framing"), o.framing, settings.framing);
+        fillSelect($("hwdec"), o.hwdec, settings.hwdec);
+        fillSelect($("onBlur"), o.onBlur, settings.onBlur);
+        $("offsetMs").value = settings.offsetMs;
+        $("preroll").value = settings.preroll;
+        $("audio").checked = settings.audio;
+        $("audioChannels").value = String(settings.audioChannels);
+        $("stillDir").textContent = settings.stillDir;
+        $("stillDir").title = settings.stillDir;
+      });
+
+      iina.onMessage("helper", (data) => {
+        const panel = $("helperPanel");
+        panel.style.display = data.installed ? "none" : "block";
+        if (data.error) {
+          $("helperText").textContent = data.error;
+          $("download").disabled = false;
+          $("download").textContent = "Try again";
+        }
+      });
+
+      iina.onMessage("download-progress", (data) => {
+        $("helperText").textContent = data.text;
+      });
+
+      $("download").addEventListener("click", () => {
+        $("download").disabled = true;
+        $("helperText").textContent = "Starting download…";
+        iina.postMessage("download", {});
+      });
+
+      iina.onMessage("devices", (data) => {
+        const status = $("status");
+        if (!data.driver) {
+          status.className = "status warn";
+          status.textContent =
+            "Blackmagic Desktop Video isn't installed. Install it from " +
+            "blackmagicdesign.com/support, then rescan.";
+          fillSelect($("device"), [{ value: "", label: "No devices" }], "");
+          return;
+        }
+        if (!data.devices.length) {
+          status.className = "status warn";
+          status.textContent =
+            "Desktop Video is installed but no device is connected.";
+          fillSelect($("device"), [{ value: "", label: "No devices" }], "");
+          return;
+        }
+        status.className = "status";
+        status.textContent =
+          data.devices.length === 1
+            ? `Found ${data.devices[0]}.`
+            : `Found ${data.devices.length} devices.`;
+        const options = [{ value: "", label: "First available" }].concat(
+          data.devices.map((d) => ({ value: d, label: d })),
+        );
+        fillSelect($("device"), options, settings ? settings.device : "");
+      });
+
+      // The resolutions this device can actually output, derived from its
+      // progressive modes. Replaces whatever placeholder list the settings
+      // message carried, keeping the current selection if it still exists.
+      // The only source of output sizes is the device itself. Until this
+      // arrives the control reads "Scanning…"; nothing is ever offered that the
+      // hardware has not reported.
+      iina.onMessage("resolutions", (data) => {
+        const wanted = settings
+          ? settings.lockResolution
+          : $("lockResolution").value;
+        const options = (data.resolutions || []).slice();
+        if (options.length === 0) {
+          // No device, or it could not be read. Keep showing the saved size
+          // rather than dropping it — leaving it selected means Apply can't
+          // silently rewrite the user's choice to something else.
+          options.push(
+            wanted
+              ? { value: wanted, label: wanted.replace("x", " × ") + " (saved)" }
+              : { value: "", label: "Auto (follow the source)" },
+          );
+        }
+        fillSelect($("lockResolution"), options, wanted);
+      });
+
+      function collect() {
+        return {
+          device: $("device").value,
+          lockResolution: $("lockResolution").value,
+          pixfmt: $("pixfmt").value,
+          levels: $("levels").value,
+          link: $("link").value,
+          framing: $("framing").value,
+          hwdec: $("hwdec").value,
+          preroll: parseInt($("preroll").value, 10) || 3,
+          offsetMs: parseInt($("offsetMs").value, 10) || 0,
+          audio: $("audio").checked,
+          audioChannels: parseInt($("audioChannels").value, 10) || 2,
+          onBlur: $("onBlur").value,
+        };
+      }
+
+      $("apply").addEventListener("click", () => {
+        iina.postMessage("save", collect());
+        const status = $("status");
+        const previous = status.textContent;
+        status.textContent = "Applied.";
+        setTimeout(() => (status.textContent = previous), 1200);
+      });
+
+      $("refresh").addEventListener("click", () => {
+        $("status").textContent = "Rescanning…";
+        iina.postMessage("refresh", {});
+      });
+
+      // Changing the device changes which modes exist, so reload the list.
+      $("device").addEventListener("change", () => {
+        iina.postMessage("save", collect());
+        iina.postMessage("refresh", {});
+      });
+
+      // Takes effect immediately rather than through Apply, matching Rescan
+      // and Download: there is nothing to preview first, just a folder pick.
+      $("stillDirChoose").addEventListener("click", () => {
+        iina.postMessage("chooseStillDir", {});
+      });
+
+      $("stillDirReveal").addEventListener("click", () => {
+        iina.postMessage("revealStillDir", {});
+      });
+
+      // Every handler is registered by this point, so it is now safe for the
+      // plugin to send the settings. Doing it the other way round races the
+      // webview's load and leaves the window empty.
+      iina.postMessage("ready", {});
+    </script>
+  </body>
+</html>

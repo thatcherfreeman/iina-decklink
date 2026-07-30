@@ -1,13 +1,14 @@
-*.csv
-__pycache__*
-.vscode*
-*.DS_Store*
-*.drx
-*.aux
-*.out
-*.synctex.gz
-*.log
-*.toc
+# Build output
+native/build/
+plugin/bin/
+dist/
+
+# The DeckLink SDK is behind a registration wall and can't be redistributed.
+# Download it from blackmagicdesign.com/support and unpack it here.
+DeckLinkSDK/
+
+*.DS_Store
 .mypy_cache*
 .pytest_cache*
-.coverage
+__pycache__*
+.vscode*

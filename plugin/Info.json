@@ -1,0 +1,39 @@
+{
+  "name": "DeckLink Output",
+  "identifier": "com.thatcherfreeman.iina-decklink",
+  "version": "0.1.0",
+  "description": "Sends a clean feed of the playing video to a Blackmagic DeckLink or UltraStudio device, for viewing on a reference monitor. Code values are rescaled and repacked but never colour-converted.",
+  "author": {
+    "name": "Thatcher Freeman",
+    "email": "me@thatcherfreeman.com"
+  },
+  "entry": "index.js",
+  "preferencesPage": "pref.html",
+  "permissions": [
+    "show-osd",
+    "show-alert",
+    "file-system",
+    "network-request"
+  ],
+  "allowedDomains": [
+    "github.com",
+    "objects.githubusercontent.com"
+  ],
+  "preferenceDefaults": {
+    "enabled": false,
+    "device": "",
+    "lock_resolution": "1920x1080",
+    "pixfmt": "v210",
+    "levels": "video",
+    "link": "single",
+    "framing": "fit",
+    "preroll": 3,
+    "offset_ms": 0,
+    "hwdec": "auto",
+    "audio": false,
+    "audio_channels": 2,
+    "helper_path": "",
+    "still_dir": "~/Desktop",
+    "on_blur": "nothing"
+  }
+}

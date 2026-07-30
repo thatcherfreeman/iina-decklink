@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>DeckLink Output</title>
+    <style>
+      * { box-sizing: border-box; }
+      html { margin: 0; padding: 0; }
+      body {
+        padding: 16px;
+        margin: 0;
+        font-size: 13px;
+        font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+      }
+      p { margin: 0; }
+      small, .small { font-size: 11px; }
+      .secondary { color: rgba(0, 0, 0, 0.5); }
+      @media (prefers-color-scheme: dark) {
+        .secondary { color: rgba(255, 255, 255, 0.5); }
+      }
+      .pref-section { margin-bottom: 14px; }
+      .pref-help { margin-top: 2px; }
+      code {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 11px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="pref-section">
+      <p>
+        Most settings live in <strong>Plugin → DeckLink Settings…</strong>,
+        which lists the devices and output resolutions your hardware actually
+        reports. Set the resolution to whatever your monitor expects — the
+        picture is scaled to it and only the frame rate is negotiated against
+        the file. This page covers the few settings that are set once.
+      </p>
+    </div>
+
+    <div class="pref-section">
+      <label>
+        <input type="checkbox" data-type="bool" data-pref-key="enabled" />
+        Send to DeckLink automatically when a file opens
+      </label>
+      <p class="small secondary pref-help">
+        Off by default, so opening IINA doesn't take over a card another
+        application may be using.
+      </p>
+    </div>
+
+    <div class="pref-section">
+      Behaviour when IINA isn't frontmost is set from the settings window too
+      — <strong>Do nothing</strong>, <strong>Blank to black</strong> (keeps the
+      card, but stops showing a frozen frame while you're away), or
+      <strong>Release the device</strong> (hands it to Resolve or a capture
+      application instead).
+    </div>
+
+    <div class="pref-section">
+      Helper binary:
+      <p class="small secondary pref-help">
+        Leave blank to use the copy in the plugin's data folder, which is what
+        the first-run download installs. Set this to point at a local build
+        instead — the path to <code>iina-decklink-helper</code>.
+      </p>
+      <div style="margin-top: 4px">
+        <input
+          type="text"
+          data-pref-key="helper_path"
+          placeholder="(use the installed helper)"
+          autocomplete="off"
+          autocorrect="off"
+          autocapitalize="off"
+          spellcheck="false"
+          style="width: 100%"
+        />
+      </div>
+    </div>
+
+    <div class="pref-section">
+      <p class="small secondary">
+        Requires Blackmagic Desktop Video, from
+        <code>blackmagicdesign.com/support</code>. The plugin sends a clean
+        feed: no OSD, no subtitles, and no colour conversion — code values are
+        rescaled and repacked only, so HDR material reaches the card carrying
+        its original values.
+      </p>
+    </div>
+  </body>
+</html>
