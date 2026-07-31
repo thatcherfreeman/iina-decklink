@@ -1,5 +1,6 @@
 # Build output
 native/build/
+native/third_party/
 plugin/bin/
 dist/
 

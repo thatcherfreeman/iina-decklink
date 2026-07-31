@@ -32,6 +32,17 @@ echo "==> Building the helper"
 "$ROOT/scripts/build_native.sh" Release >/dev/null
 cp "$ROOT/plugin/bin/iina-decklink-helper" "$STAGE/"
 
+# A release must never bundle Homebrew's ffmpeg: it's built --enable-gpl and
+# links libx264/libx265, which puts a GPLv3 obligation on the whole tarball
+# for encoders this playback-only helper never calls. build_native.sh only
+# uses the decode-only LGPL build when scripts/build_ffmpeg_lgpl.sh has been
+# run; refuse to package rather than silently ship the wrong one.
+if [[ "$(cat "$ROOT/native/build/.ffmpeg_selection" 2>/dev/null)" != "lgpl" ]]; then
+    echo "error: the helper wasn't built against the LGPL FFmpeg." >&2
+    echo "       Run scripts/build_ffmpeg_lgpl.sh, then re-run this script." >&2
+    exit 1
+fi
+
 # ---------------------------------------------------------------------------
 # Bundle the FFmpeg libraries.
 #
@@ -51,7 +62,7 @@ bundle_deps() {
     local deps dep base
 
     deps=$(otool -L "$target" | tail -n +2 | awk '{print $1}' \
-           | grep -E '^(/opt/homebrew|/usr/local)' || true)
+           | grep -E "^($ROOT/native/third_party|/opt/homebrew|/usr/local)" || true)
 
     for dep in $deps; do
         base="$(basename "$dep")"
@@ -71,12 +82,46 @@ bundle_deps "$STAGE/iina-decklink-helper"
 
 echo "==> Verifying nothing outside the bundle is referenced"
 leftover=$(otool -L "$STAGE/iina-decklink-helper" | tail -n +2 | awk '{print $1}' \
-           | grep -E '^(/opt/homebrew|/usr/local)' || true)
+           | grep -E "^($ROOT/native/third_party|/opt/homebrew|/usr/local)" || true)
 if [[ -n "$leftover" ]]; then
     echo "error: unbundled dependencies remain:" >&2
     echo "$leftover" >&2
     exit 1
 fi
+
+# Belt and suspenders on top of the .ffmpeg_selection check above: even
+# having built against the right FFmpeg, make sure no GPL-only library
+# somehow ended up in the bundle.
+gpl_libs=$(ls "$STAGE"/*.dylib 2>/dev/null | grep -iE 'x264|x265|mp3lame' || true)
+if [[ -n "$gpl_libs" ]]; then
+    echo "error: GPL-licensed libraries ended up in the release bundle:" >&2
+    echo "$gpl_libs" >&2
+    exit 1
+fi
+
+# LGPL requires the license text travel with the binary, and (since these
+# libraries aren't modified from upstream) a pointer to that exact source is
+# enough to satisfy the source-availability obligation.
+FFMPEG_VERSION="$(sed -n 's/.*FFMPEG_VERSION "\(.*\)"/\1/p' \
+    "$ROOT/native/third_party/ffmpeg-lgpl/include/libavutil/ffversion.h" 2>/dev/null || true)"
+cat > "$STAGE/THIRD_PARTY_NOTICES.txt" <<EOF
+This build bundles FFmpeg shared libraries (libavformat, libavcodec,
+libavfilter, libavutil, libswscale, libswresample), built decode-only with
+no GPL or nonfree components (see scripts/build_ffmpeg_lgpl.sh in the
+iina-decklink source repository for the exact build configuration used).
+They are unmodified upstream FFmpeg and are licensed under the GNU Lesser
+General Public License version 2.1 or later (LGPL-2.1+); see LGPL-2.1.txt
+in this directory for the full license text.
+
+Corresponding source: https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION:-<version>}.tar.xz
+FFmpeg project: https://ffmpeg.org/
+
+These libraries are dynamically linked (see the .dylib files alongside the
+iina-decklink-helper binary) so they can be replaced with a compatible build
+of your own.
+EOF
+curl -sL "https://www.gnu.org/licenses/old-licenses/lgpl-2.1.txt" \
+    -o "$STAGE/LGPL-2.1.txt" || echo "warning: could not fetch LGPL text for bundling" >&2
 
 # ---------------------------------------------------------------------------
 # Sign.  Libraries first, then the executable, which is the order codesign

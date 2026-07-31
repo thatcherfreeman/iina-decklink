@@ -370,33 +370,6 @@ static DlkOutputIface find_output_iface(IDeckLink *device)
     return iface;
 }
 
-// Sets single-, dual- or quad-link SDI output (ported from the author's
-// nomacs-decklink plugin's equivalent setting). Multi-link splits the signal
-// across two or four SDI connectors/cables to raise available bandwidth —
-// needed for some high-bandwidth combinations (e.g. 4:4:4 at high frame
-// rates/resolutions) that don't fit a single link. Must be set before
-// GetDisplayModeIterator()/EnableVideoOutput(): it can change which display
-// modes the device even offers. No-ops (logging at debug level) on hardware
-// that doesn't expose IDeckLinkConfiguration or reports it unsupported —
-// most single-connector devices, which is the common case.
-static void set_sdi_link_configuration(IDeckLink *device, int link_mode)
-{
-    IDeckLinkConfiguration *cfg = nullptr;
-    if (device->QueryInterface(IID_IDeckLinkConfiguration, (void **)&cfg) != S_OK) {
-        dlk_logf(2, "DeckLink: IDeckLinkConfiguration unavailable — cannot set SDI link mode");
-        return;
-    }
-    BMDLinkConfiguration link;
-    switch (link_mode) {
-    case DLK_LINK_DUAL: link = bmdLinkConfigurationDualLink; break;
-    case DLK_LINK_QUAD: link = bmdLinkConfigurationQuadLink; break;
-    default:            link = bmdLinkConfigurationSingleLink; break;
-    }
-    if (cfg->SetInt(bmdDeckLinkConfigSDIOutputLinkConfiguration, link) != S_OK)
-        dlk_logf(1, "DeckLink: device doesn't support setting SDI link configuration");
-    cfg->Release();
-}
-
 // RAII lock on a mutable video frame's write buffer, spanning every SDK era:
 // current IDeckLinkVideoBuffer, the 15.3.1-only IDeckLinkVideoBuffer_v15_3_1,
 // or (pre-15.x, no separate buffer interface at all) GetBytes directly on
@@ -601,6 +574,15 @@ struct dlk_output {
     int              audio_channels = 2;
     int64_t          audio_sample_pos = 0;  // next timestamp, in samples @48kHz
 
+    // Persistent (non-volatile) device settings this output takes ownership of
+    // while it's open, plus what they were on entry so close() can put them
+    // back — see the "persistent device configuration" helpers below.
+    IDeckLinkConfiguration *config = nullptr;
+    DlkBool          saved_444       = false;
+    bool             have_saved_444  = false;
+    int64_t          saved_link      = 0;
+    bool             have_saved_link = false;
+
     // Full-range → SMPTE legal-range mapping for RGB output formats.  YUV
     // range handling happens upstream in swscale; RGB legal range does not
     // exist in swscale, so it is applied here during packing via LUT.
@@ -630,6 +612,116 @@ static void init_rgb_luts(dlk_output *d)
         d->lut8[i] = (uint8_t)(16 + (i * 219 + 127) / 255);
     for (int i = 0; i < 1024; i++)
         d->lut10[i] = (uint16_t)(64 + (i * 876 + 511) / 1023);
+}
+
+// --- persistent device configuration ---------------------------------------
+//
+// The SDI output settings below are *non-volatile* device state: they survive
+// the process, and Blackmagic's own Desktop Video Setup panel exposes the
+// same switches. So they must be set to match what this output is actually
+// going to put on the wire — inheriting whatever a previous app (or the user)
+// left behind silently corrupts the picture. Whatever they were on entry is
+// saved and put back by restore_device_config() on close, so owning them for
+// the duration of playback doesn't clobber the user's panel settings.
+//
+// All of these no-op (logging at debug level) on hardware that doesn't expose
+// IDeckLinkConfiguration or reports the setting unsupported.
+
+static void open_device_config(dlk_output *d)
+{
+    if (d->device->QueryInterface(IID_IDeckLinkConfiguration, (void **)&d->config) != S_OK) {
+        d->config = nullptr;
+        dlk_logf(2, "DeckLink: IDeckLinkConfiguration unavailable — SDI output "
+                    "settings left as the driver has them");
+    }
+}
+
+// Sets single-, dual- or quad-link SDI output (ported from the author's
+// nomacs-decklink plugin's equivalent setting). Multi-link splits the signal
+// across two or four SDI connectors/cables to raise available bandwidth —
+// needed for some high-bandwidth combinations (e.g. 4:4:4 at high frame
+// rates/resolutions) that don't fit a single link. Must be set before
+// GetDisplayModeIterator()/EnableVideoOutput(): it can change which display
+// modes the device even offers.
+static void set_sdi_link_configuration(dlk_output *d, int link_mode)
+{
+    if (!d->config)
+        return;
+    BMDLinkConfiguration want;
+    switch (link_mode) {
+    case DLK_LINK_DUAL: want = bmdLinkConfigurationDualLink; break;
+    case DLK_LINK_QUAD: want = bmdLinkConfigurationQuadLink; break;
+    default:            want = bmdLinkConfigurationSingleLink; break;
+    }
+    int64_t prev = 0;
+    if (d->config->GetInt(bmdDeckLinkConfigSDIOutputLinkConfiguration, &prev) != S_OK) {
+        dlk_logf(2, "DeckLink: device has no SDI link configuration setting");
+        return;
+    }
+    if (prev == want)
+        return;
+    if (d->config->SetInt(bmdDeckLinkConfigSDIOutputLinkConfiguration, want) != S_OK) {
+        dlk_logf(1, "DeckLink: device doesn't support setting SDI link configuration");
+        return;
+    }
+    d->saved_link      = prev;
+    d->have_saved_link = true;
+}
+
+// Tells the device whether the SDI output carries RGB 4:4:4 or YCbCr 4:2:2.
+//
+// This is the setting Desktop Video Setup calls "4:4:4 SDI Output", and it is
+// sticky: a user chasing 10-bit 4:4:4 typically turns it on there and leaves
+// it on. It controls how the deck encodes the link and what it writes into
+// the payload ID — it does NOT follow the pixel format of the frames handed
+// to ScheduleVideoFrame. So if it is left on while we send YCbCr (which is
+// exactly what happens when resolve_pixfmt() downgrades 4:4:4 to 4:2:2 for
+// bandwidth), the monitor decodes Y/Cb/Cr as G/B/R: luma lands on green and
+// both chroma channels sit near their midpoint, and the whole picture comes
+// out green. Hence: set it explicitly, every time, from the pixel format we
+// actually ended up with.
+//
+// Must be called before EnableVideoOutput().
+static void set_sdi_444_output(dlk_output *d, bool want_444)
+{
+    if (!d->config)
+        return;
+    DlkBool prev = false;
+    if (d->config->GetFlag(bmdDeckLinkConfig444SDIVideoOutput, &prev) != S_OK) {
+        // Devices with no SDI connector (or no 4:4:4 capability) don't
+        // implement the flag at all — nothing to reconcile.
+        dlk_logf(2, "DeckLink: device has no 4:4:4 SDI output setting");
+        return;
+    }
+    if (!prev == !want_444)
+        return;
+    if (d->config->SetFlag(bmdDeckLinkConfig444SDIVideoOutput, want_444) != S_OK) {
+        dlk_logf(1, "DeckLink: could not switch the SDI output to %s — the "
+                    "picture may come out miscolored if the device's "
+                    "\"4:4:4 SDI Output\" setting doesn't match the signal",
+                 want_444 ? "4:4:4" : "4:2:2");
+        return;
+    }
+    dlk_logf(1, "DeckLink: SDI output switched to %s to match the pixel format",
+             want_444 ? "RGB 4:4:4" : "YCbCr 4:2:2");
+    d->saved_444      = prev;
+    d->have_saved_444 = true;
+}
+
+// Puts back every persistent setting this output changed, then drops the
+// configuration interface. Called on close and on the create failure path.
+static void restore_device_config(dlk_output *d)
+{
+    if (d->config) {
+        if (d->have_saved_444)
+            d->config->SetFlag(bmdDeckLinkConfig444SDIVideoOutput, d->saved_444);
+        if (d->have_saved_link)
+            d->config->SetInt(bmdDeckLinkConfigSDIOutputLinkConfiguration, d->saved_link);
+        d->config->Release();
+        d->config = nullptr;
+    }
+    d->have_saved_444  = false;
+    d->have_saved_link = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -943,7 +1035,8 @@ static BMDPixelFormat bmd_pixel_format(int pixfmt)
 // subsampled already, so this costs no real fidelity, and it lets high frame
 // rates (where 4:4:4 commonly exceeds single-link SDI bandwidth that 4:2:2
 // fits within) keep outputting instead of failing to display at all.
-static int resolve_pixfmt(DlkOutputIface &out, BMDDisplayMode mode, int pixfmt)
+static int resolve_pixfmt(DlkOutputIface &out, BMDDisplayMode mode, int pixfmt,
+                          int link_mode)
 {
     int fallback = (pixfmt == DLK_PIXFMT_RGB10) ? DLK_PIXFMT_V210
                   : (pixfmt == DLK_PIXFMT_ARGB)  ? DLK_PIXFMT_UYVY
@@ -960,7 +1053,9 @@ static int resolve_pixfmt(DlkOutputIface &out, BMDDisplayMode mode, int pixfmt)
         return pixfmt;
 
     dlk_logf(1, "DeckLink: requested pixel format unsupported at this mode "
-                "(bandwidth) — falling back from 4:4:4 to 4:2:2");
+                "(bandwidth) — falling back from 4:4:4 to 4:2:2%s",
+             link_mode != DLK_LINK_SINGLE ? ""
+                 : " — enabling dual- or quad-link SDI output may fit it");
     return fallback;
 }
 
@@ -1007,16 +1102,18 @@ DLK_EXPORT dlk_output *dlk_output_create(
                     "will be used instead of zero-copy buffers",
                  d->output.v14 ? "pre-15.x" : "15.x");
 
+    open_device_config(d);
+
     // Before mode enumeration: link configuration can change which display
     // modes the device offers (some high-bandwidth modes only appear once
     // dual link is set).
-    set_sdi_link_configuration(d->device, link_mode);
+    set_sdi_link_configuration(d, link_mode);
 
     if (!find_mode(d, src_width, src_height, src_fps, format_code,
                    fixed_width, fixed_height))
         goto fail;
 
-    d->pixfmt = resolve_pixfmt(d->output, d->bmd_mode, pixfmt);
+    d->pixfmt = resolve_pixfmt(d->output, d->bmd_mode, pixfmt, link_mode);
 
     switch (d->pixfmt) {
     case DLK_PIXFMT_UYVY:
@@ -1039,6 +1136,11 @@ DLK_EXPORT dlk_output *dlk_output_create(
         dlk_logf(0, "DeckLink: unknown pixel format %d", pixfmt);
         goto fail;
     }
+
+    // Only now — after the fallback above may have turned a 4:4:4 request into
+    // 4:2:2 — is it known what the wire actually carries, and the device has
+    // to be told, or it keeps encoding the SDI link however it was last left.
+    set_sdi_444_output(d, d->pixfmt == DLK_PIXFMT_RGB10 || d->pixfmt == DLK_PIXFMT_ARGB);
 
     d->callback.lock             = &d->lock;
     d->callback.frames_in_flight = &d->frames_in_flight;
@@ -1083,6 +1185,7 @@ fail:
     for (IDeckLinkMutableVideoFrame *f : d->compat_pool)
         if (f) f->Release();
     d->output.release();
+    restore_device_config(d);
     if (d->device) { d->device->Release(); d->device = nullptr; }
     delete d;
     return nullptr;
@@ -1101,6 +1204,9 @@ DLK_EXPORT void dlk_output_destroy(dlk_output *d)
             d->output.DisableAudioOutput();
         d->output.release();
     }
+    // After DisableVideoOutput, so putting the SDI settings back can't disturb
+    // a signal that's still on the wire.
+    restore_device_config(d);
     if (d->device)
         d->device->Release();
     // Release the v14.x fallback pool, if one was created.

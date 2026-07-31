@@ -192,8 +192,10 @@ fall back to software automatically.
 
 ## Building from source
 
-Needs cmake, pkg-config, FFmpeg development headers (`brew install ffmpeg`),
-and the [DeckLink SDK](https://www.blackmagicdesign.com/support/) unpacked at
+Needs cmake, pkg-config, FFmpeg development headers (`brew install ffmpeg` is
+fine for local dev — see "FFmpeg licensing" under Releasing for why a release
+build uses a different one), and the
+[DeckLink SDK](https://www.blackmagicdesign.com/support/) unpacked at
 `DeckLinkSDK/` in the repo root. The SDK is behind a registration wall, so it
 isn't committed here.
 
@@ -259,14 +261,21 @@ nothing but system frameworks — and `dist/iina-decklink.iinaplgz`. Publish the
 tarball as a release asset under exactly that filename; the plugin fetches it
 by name. Notarize it, or users get a Gatekeeper prompt.
 
-**Known issue for release builds:** packaging currently bundles whatever
-FFmpeg the helper was built against. Homebrew's is `--enable-gpl` and drags in
-x264, x265, SvtAv1Enc and lame — about 12.6 MB of encoders that a playback-only
-helper never calls, and a GPLv3 obligation on the whole bundle. A decode-only
-LGPL configure (`--disable-encoders --disable-muxers --disable-programs`, no
-`--enable-gpl`) gets the tarball to roughly 7–10 MB and loses nothing: the
-HEVC, H.264, ProRes and DNxHD *decoders* are all native to libavcodec, and
-x264/x265 are encoders only.
+**FFmpeg licensing:** run `scripts/build_ffmpeg_lgpl.sh` once before
+packaging. It builds a decode-only FFmpeg from source with no `--enable-gpl`
+and no `--enable-nonfree`, into `native/third_party/ffmpeg-lgpl/`, and
+`scripts/build_native.sh` links against it automatically whenever it's
+present. Homebrew's ffmpeg, by contrast, is built `--enable-gpl
+--enable-version3` and links x264/x265/lame — a GPLv3 obligation on the whole
+bundle for encoders this playback-only helper never calls.
+`scripts/package.sh` refuses to produce a tarball unless the helper was built
+against the LGPL FFmpeg, and separately scans the bundle for x264/x265/lame
+as a second check. The resulting tarball is about 9.4 MB (vs ~15 MB for the
+GPL one) and carries `THIRD_PARTY_NOTICES.txt` plus the LGPL-2.1 license text,
+since those are dynamically-linked LGPL libraries being redistributed.
+HEVC, H.264, ProRes and DNxHD *decoding* is all native to libavcodec and
+needs none of this — x264/x265/lame are encoders only, and Grab Still's own
+encoding need (a TIFF) is native and LGPL too.
 
 ## Limitations
 
@@ -317,3 +326,17 @@ first (see "Choosing the output size" above). Verified this session against
 the current SDK on a real UltraStudio 4K Mini; the 14.2.1/15.3.1 code paths are
 unchanged from the reference but weren't independently re-tested against an
 old driver install, since none was available to test against.
+
+## License
+
+MIT — see `LICENSE`. Running as an IINA plugin doesn't change that: IINA
+(GPLv3) treats plugins built against its documented plugin API as separate,
+independent works under GPLv3 §5(d)'s aggregate clause, and this one goes
+further than most by doing its actual work in a wholly separate helper
+process with no linkage into IINA at all.
+
+Bundled third-party components keep their own licenses and aren't covered by
+the MIT grant above: the Blackmagic DeckLink SDK (permissive, see the license
+header in `DeckLinkSDK/Mac/include/DeckLinkAPI.h` — not redistributed in this
+repo, see `.gitignore`) and, in release builds, FFmpeg (LGPL-2.1+, built
+decode-only with no GPL components — see "FFmpeg licensing" under Releasing).
