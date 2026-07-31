@@ -249,17 +249,23 @@ verified to be true broadcast black (Y=64, Cb=Cr=512 for 10-bit YUV) rather
 than zeros — zero-filling a YUV canvas puts chroma at 0 and the bars come out
 green.
 
+`scripts/test_native.sh` packages a small subset of this — play/still/dump
+against a committed test clip — as pass/fail checks CI runs on every push.
+It's a floor against outright breakage, not a substitute for the manual
+hardware testing above.
+
 ## Releasing
 
-```sh
-SIGN_IDENTITY="Developer ID Application: … (TEAMID)" scripts/package.sh
-```
+Cutting a signed, notarized release — including one-time Developer ID and
+notarization setup — is covered in [RELEASING.md](RELEASING.md). Signing and
+notarization happen locally, never in CI; see that file and the comment at
+the top of `.github/workflows/ci.yml` for why.
 
-Produces `dist/iina-decklink-helper-<arch>.tar.gz` — the helper plus its
-FFmpeg libraries, install names rewritten to `@loader_path` so it depends on
-nothing but system frameworks — and `dist/iina-decklink.iinaplgz`. Publish the
-tarball as a release asset under exactly that filename; the plugin fetches it
-by name. Notarize it, or users get a Gatekeeper prompt.
+`dist/iina-decklink-helper-<arch>.tar.gz` (the helper plus its FFmpeg
+libraries, install names rewritten to `@loader_path` so it depends on nothing
+but system frameworks) and `dist/iina-decklink.iinaplgz` are what get
+attached to the GitHub release; the plugin fetches the tarball by that exact
+filename on first run.
 
 **FFmpeg licensing:** run `scripts/build_ffmpeg_lgpl.sh` once before
 packaging. It builds a decode-only FFmpeg from source with no `--enable-gpl`

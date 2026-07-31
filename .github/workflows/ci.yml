@@ -1,0 +1,69 @@
+# Compile check + smoke tests on every push and PR. Runs unsigned/ad-hoc
+# builds only — no Developer ID certificate or notarization credentials ever
+# touch GitHub Actions. The real signed, notarized release is built and
+# published locally; see RELEASING.md and scripts/release_macos.sh.
+
+name: ci
+on: [push, pull_request]
+
+jobs:
+  native:
+    # DeckLink hardware output is macOS-only (see native/CMakeLists.txt), and
+    # scripts/*.sh assume Apple Silicon (/opt/homebrew, arm64 tarball naming)
+    # — an Intel runner would silently diverge from what's actually shipped.
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: brew install pkg-config openssl@3
+
+      - name: Cache decode-only LGPL FFmpeg
+        id: ffmpeg-cache
+        uses: actions/cache@v4
+        with:
+          path: native/third_party/ffmpeg-lgpl
+          key: ffmpeg-lgpl-${{ runner.os }}-${{ hashFiles('scripts/build_ffmpeg_lgpl.sh') }}
+
+      - name: Build decode-only LGPL FFmpeg
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        run: scripts/build_ffmpeg_lgpl.sh
+
+      - name: Build helper
+        run: scripts/build_native.sh Release
+
+      - name: Native smoke tests
+        run: scripts/test_native.sh
+
+      - name: Package (unsigned) — enforces the LGPL-only FFmpeg gate
+        run: scripts/package.sh
+
+  plugin:
+    # Pure JS/JSON checks — no DeckLink SDK, no native build — so this runs
+    # on a plain Linux runner rather than burning macOS-runner minutes
+    # (GitHub bills those at a 10x multiplier over Linux).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Syntax-check plugin JS
+        run: |
+          set -e
+          for f in plugin/*.js; do
+            echo "checking $f"
+            node --check "$f"
+          done
+
+      - name: Validate Info.json
+        run: |
+          node -e '
+            const info = require("./plugin/Info.json");
+            for (const key of ["name", "version", "identifier", "author", "entry"]) {
+              if (!(key in info)) throw new Error(`Info.json missing required field: ${key}`);
+            }
+            if (!info.author.name) throw new Error("Info.json author.name missing");
+            console.log("Info.json ok:", info.name, info.version);
+          '

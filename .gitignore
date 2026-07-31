@@ -4,9 +4,9 @@ native/third_party/
 plugin/bin/
 dist/
 
-# The DeckLink SDK is behind a registration wall and can't be redistributed.
-# Download it from blackmagicdesign.com/support and unpack it here.
-DeckLinkSDK/
+# Signing identity + notarization profile name for scripts/release_macos.sh.
+# Never committed — see release.env.example and RELEASING.md.
+release.env
 
 *.DS_Store
 .mypy_cache*

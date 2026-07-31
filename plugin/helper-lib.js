@@ -278,10 +278,7 @@ async function downloadHelper(onProgress) {
       `set -e
        mkdir -p "${binDir}"
        tar -xzf "${archive}" -C "${binDir}"
-       chmod +x "${binDir}/iina-decklink-helper"
-       # Clear the quarantine flag the download attaches, which would
-       # otherwise make Gatekeeper refuse to run it.
-       xattr -cr "${binDir}"`,
+       chmod +x "${binDir}/iina-decklink-helper"`,
     ]);
     if (status !== 0) return `Could not unpack the helper: ${stderr}`;
 

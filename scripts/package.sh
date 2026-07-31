@@ -11,11 +11,15 @@
 # plugins by downloading the repository's contents, so the helper is fetched
 # separately on first run.
 #
-# Signing: set SIGN_IDENTITY to a Developer ID Application identity to produce
-# a binary that opens with no Gatekeeper prompt.  Without it the helper is
-# ad-hoc signed, which runs locally but will be blocked on other machines.
+# Signing: set SIGN_IDENTITY to a Developer ID Application identity, and
+# NOTARY_PROFILE to a notarytool keychain-profile name, to produce a binary
+# that opens with no Gatekeeper prompt on another machine. Without them the
+# helper is ad-hoc signed, which runs locally but nowhere else. See
+# RELEASING.md for one-time setup (certificate + notarytool credentials) —
+# in normal use, run scripts/release_macos.sh instead of this directly.
 #
-#   SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" scripts/package.sh
+#   SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" \
+#       NOTARY_PROFILE="your-notary-profile" scripts/package.sh
 #
 set -euo pipefail
 
@@ -133,11 +137,41 @@ if [[ -n "$SIGN_IDENTITY" ]]; then
         [[ -e "$lib" ]] || continue
         codesign --force --timestamp --options runtime --sign "$SIGN_IDENTITY" "$lib"
     done
-    codesign --force --timestamp --options runtime --sign "$SIGN_IDENTITY" \
-        "$STAGE/iina-decklink-helper"
-    echo "    Notarize before publishing:"
-    echo "      ditto -c -k --keepParent $STAGE notarize.zip"
-    echo "      xcrun notarytool submit notarize.zip --keychain-profile <profile> --wait"
+    # Only the executable needs the library-validation exception: it's the
+    # one that dlopens Blackmagic's DeckLinkAPI.framework (a different Team
+    # ID) at runtime. Without it, a hardened-runtime binary passes
+    # notarization fine and then finds zero devices on every machine it runs
+    # on — the framework load is silently refused.
+    codesign --force --timestamp --options runtime \
+        --entitlements "$ROOT/scripts/release.entitlements" \
+        --sign "$SIGN_IDENTITY" "$STAGE/iina-decklink-helper"
+
+    echo "==> Verifying the signature"
+    codesign --verify --deep --strict --verbose=2 "$STAGE/iina-decklink-helper"
+
+    if [[ -n "${NOTARY_PROFILE:-}" ]]; then
+        echo "==> Notarizing (this can take a few minutes)"
+        # notarytool takes a zip/dmg/pkg, never a bare binary or a .tar.gz —
+        # this zip exists only to satisfy that; the release tarball built
+        # below is unaffected by notarization (it doesn't modify the signed
+        # files) so there's nothing to redo afterward.
+        NOTARIZE_ZIP="$DIST/notarize.zip"
+        ditto -c -k --keepParent "$STAGE" "$NOTARIZE_ZIP"
+        xcrun notarytool submit "$NOTARIZE_ZIP" \
+            --keychain-profile "$NOTARY_PROFILE" --wait
+        rm -f "$NOTARIZE_ZIP"
+        # Not stapled: stapler only attaches to an .app/.pkg/.dmg container,
+        # and this ships as a bare binary + dylibs. Gatekeeper instead
+        # confirms the notarization ticket online on first launch — the
+        # normal, Apple-documented path for a notarized command-line tool
+        # that isn't bundled as a .app. That first launch already needs
+        # network (it was just downloaded from GitHub), so this costs
+        # nothing in practice.
+    else
+        echo "==> Skipping notarization (set NOTARY_PROFILE to notarize —"
+        echo "    see RELEASING.md). Signed but unnotarized; Gatekeeper will"
+        echo "    still block this build on another machine."
+    fi
 else
     echo "==> Ad-hoc signing (set SIGN_IDENTITY for a distributable build)"
     for lib in "$STAGE"/*.dylib; do
@@ -149,6 +183,11 @@ fi
 
 echo "==> Checking the packaged helper runs"
 "$STAGE/iina-decklink-helper" --version >/dev/null
+
+if [[ -n "$SIGN_IDENTITY" ]]; then
+    echo "==> Gatekeeper check"
+    spctl -a -vvv -t exec "$STAGE/iina-decklink-helper" || true
+fi
 
 TARBALL="$DIST/iina-decklink-helper-$ARCH.tar.gz"
 tar -czf "$TARBALL" -C "$STAGE" .
