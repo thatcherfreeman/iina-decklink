@@ -59,7 +59,8 @@ build (`scripts/build_native.sh` itself has no arm64-only restriction — only
 
    This is the one thing not automated: the tag `make release` creates has to
    point at a commit that actually contains the version it's tagging, so
-   nothing here stamps the file for you or commits on your behalf.
+   nothing here stamps the file for you or commits on your behalf. You do
+   *not* need to push it yourself — that's step 2.
 
 2. Run:
 
@@ -71,12 +72,15 @@ build (`scripts/build_native.sh` itself has no arm64-only restriction — only
    everything with your Developer ID (including the library-validation
    entitlement `DeckLinkAPI.framework` needs — see
    `scripts/release.entitlements`), submits it for notarization and waits for
-   Apple, then tags `v0.2.0`, pushes it (which triggers CI's compile check),
-   **waits for that CI run to finish** (streaming its progress), and
-   creates/updates the GitHub release with the signed tarball and the plugin
-   package — printing the final list of attached assets. If CI fails, it
-   still publishes the locally-built artifacts (since they already built and
-   ran fine here) but exits non-zero with a warning — check what CI caught.
+   Apple, then pushes your branch (plain push, never force — if origin has
+   commits yours doesn't, e.g. pushed from elsewhere, this stops with git's
+   own error instead of overwriting anything), tags `v0.2.0`, pushes the tag
+   (which triggers CI's compile check), **waits for that CI run to finish**
+   (streaming its progress), and creates/updates the GitHub release with the
+   signed tarball and the plugin package — printing the final list of
+   attached assets. If CI fails, it still publishes the locally-built
+   artifacts (since they already built and ran fine here) but exits non-zero
+   with a warning — check what CI caught.
 
    `scripts/package.sh` prints a `spctl` check partway through; a clean
    release should say `accepted` / `source=Notarized Developer ID`. Safe to

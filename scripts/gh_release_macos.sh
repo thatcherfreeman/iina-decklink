@@ -36,22 +36,20 @@ BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 HEAD_SHA="$(git rev-parse HEAD)"
 
 # The release is only meaningful if what's on GitHub actually matches what
-# you're about to tag. Refuse to guess — push the branch yourself first.
+# you're about to tag, so this pushes the branch itself rather than making
+# you remember to. Never force: a plain push only ever fast-forwards, so if
+# origin has commits this doesn't (e.g. pushed from elsewhere), git refuses
+# and this exits with git's own error rather than overwriting anything.
 # --verify -q avoids a git rev-parse gotcha: without --verify, an unresolved
 # ref still exits non-zero but ALSO echoes the literal argument to stdout,
 # which "|| true" would otherwise capture as if it were a real SHA.
 UPSTREAM_SHA="$(git rev-parse --verify -q "refs/remotes/origin/$BRANCH" 2>/dev/null || true)"
 if [[ -z "$UPSTREAM_SHA" ]]; then
-    echo "error: origin/$BRANCH doesn't exist — push $BRANCH first:" >&2
-    echo "  git push -u origin $BRANCH" >&2
-    exit 1
-fi
-if [[ "$UPSTREAM_SHA" != "$HEAD_SHA" ]]; then
-    echo "error: local $BRANCH ($HEAD_SHA) is not what's on origin/$BRANCH ($UPSTREAM_SHA)." >&2
-    echo "  This release script tags and publishes the current commit, so GitHub" >&2
-    echo "  needs to already have it (that's also what CI will check). Push first:" >&2
-    echo "  git push origin $BRANCH" >&2
-    exit 1
+    echo "Pushing $BRANCH (no upstream yet)..."
+    git push -u origin "$BRANCH"
+elif [[ "$UPSTREAM_SHA" != "$HEAD_SHA" ]]; then
+    echo "Pushing $BRANCH ($UPSTREAM_SHA -> $HEAD_SHA)..."
+    git push origin "$BRANCH"
 fi
 
 just_pushed=false
