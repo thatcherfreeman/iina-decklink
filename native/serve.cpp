@@ -221,6 +221,12 @@ void Session::handle(const std::string &text)
             apply_config(msg);   // load may carry the settings with it
         do_load(msg);
     } else if (cmd == "position") {
+        // No special case for a pause landing in here: feed_loop() only
+        // evicts decoded frames once the true position has actually passed
+        // them, so the exact frame a pause lands on is normally still
+        // sitting in the queue already decoded, and its general "error too
+        // large" reseek path covers the rare case it isn't (e.g. a pause
+        // right after a load, before the queue has built up any history).
         player_.clock().update(msg.num("position", 0.0), msg.num("speed", 1.0),
                               msg.boolean("paused", false));
     } else if (cmd == "seek") {
@@ -228,8 +234,6 @@ void Session::handle(const std::string &text)
         player_.clock().reset(position, msg.num("speed", 1.0),
                               msg.boolean("paused", false));
         player_.request_seek(position);
-    } else if (cmd == "pause") {
-        player_.clock().set_paused(msg.boolean("paused", true));
     } else if (cmd == "blackout") {
         // IINA's own playback keeps running throughout — this only affects
         // what the DeckLink shows, so the resume target is wherever the

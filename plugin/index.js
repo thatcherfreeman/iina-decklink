@@ -564,7 +564,11 @@ event.on("mpv.playback-restart", () => {
 
 event.on("mpv.pause.changed", () => {
   if (!outputActive) return;
-  link.send({ cmd: "pause", paused: mpv.getFlag("pause") });
+  // sendPosition() alone is enough — and, unlike a separate paused-only
+  // message with no position, it's actually correct: it carries the exact
+  // position IINA is at *right now*, which is what lets the helper's clock
+  // snap to the true paused frame instead of guessing one from wall-clock
+  // time since the last periodic report (up to 100ms — several frames).
   sendPosition();
 });
 

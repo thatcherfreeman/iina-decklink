@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 #include "log.h"
 #include "stills.h"
@@ -162,21 +163,6 @@ void MasterClock::reset(double position, double speed, bool paused)
     paused_   = paused;
     stamp_    = std::chrono::steady_clock::now();
     anchored_ = true;
-}
-
-void MasterClock::set_paused(bool paused)
-{
-    std::lock_guard<std::mutex> guard(mutex_);
-    // Fold elapsed time into the stored position before the rate changes,
-    // otherwise the pause retroactively applies to time already run.
-    auto now = std::chrono::steady_clock::now();
-    if (!paused_) {
-        double elapsed = std::chrono::duration<double>(now - stamp_).count();
-        position_        += elapsed * speed_;
-        output_position_ += elapsed;
-    }
-    paused_ = paused;
-    stamp_  = now;
 }
 
 double MasterClock::position() const
@@ -743,29 +729,71 @@ void Player::feed_loop()
         }
         was_blacked_out = false;
 
-        // Where the wire should be: IINA's position, plus the depth of the
-        // hardware queue we are scheduling behind, plus the manual trim.
+        // select_target is where the wire should be: IINA's position, plus
+        // the depth of the hardware queue we are scheduling behind, plus the
+        // manual trim. The inflight lookahead only means something for a
+        // moving playhead — it predicts where playback will have gotten to
+        // by the time a freshly scheduled frame actually reaches the wire.
+        // Paused, nothing is moving and nothing fresh is being scheduled
+        // (the loop below just re-sends the same held frame), so including
+        // it would systematically select a frame several frames ahead of
+        // the one IINA is actually showing.
+        //
+        // drop_target has no lookahead, ever: it is what actually decides
+        // which frames leave the queue for good. Discarding on the same
+        // shifted target used for live selection means every frame up to
+        // "inflight frames from now" gets freed the moment playback moves
+        // past it for scheduling purposes — including ones that were never
+        // actually shown, just skipped over while looking ahead. Pausing a
+        // moment later then finds nothing left at the true position, and
+        // the only way back is a full reseek: a real stutter, the queue
+        // flushed and redecoded from scratch for a frame that was sitting
+        // right there a few iterations ago. Evicting only once the true
+        // position has passed a frame keeps that same short stretch (at
+        // most `inflight` frames — a handful, bounded by preroll) around
+        // for as long as it might still be needed, so a pause lands on the
+        // exact right frame immediately, already decoded, every time.
         int inflight = output_->buffered_frames();
-        double target = clock_.position() + inflight * frame_period + offset;
+        double drop_target   = clock_.position() + offset;
+        double select_target = drop_target;
+        if (!clock_.paused())
+            select_target += inflight * frame_period;
 
-        // Pick the queued frame nearest the target, discarding everything that
-        // is already too old to be shown.  The chosen frame is cloned — a
-        // refcounted shallow copy — so request_seek() can clear the queue at
-        // any moment without pulling it out from under the conversion below.
+        // Evict anything the true position has already passed, then pick
+        // whichever surviving frame is nearest select_target. The chosen
+        // frame is cloned — a refcounted shallow copy — so request_seek()
+        // can clear the queue at any moment without pulling it out from
+        // under the conversion below; it is deliberately not popped, since
+        // the same entry is very likely to be the nearest one again on the
+        // next iteration too (this is what makes pause holding cheap).
         FrameRef chosen;
         double chosen_time = 0.0;
         bool starved = false;
         {
             std::unique_lock<std::mutex> lock(queue_mutex_);
             while (queue_.size() >= 2 &&
-                   queue_[1].time <= target + frame_period * 0.5) {
+                   queue_[1].time <= drop_target + frame_period * 0.5) {
                 av_frame_free(&queue_.front().frame);
                 queue_.pop_front();
                 dropped_++;
             }
+            // Queue is presentation-time ordered, so the distance to
+            // select_target decreases monotonically and then increases —
+            // stop at the first local minimum rather than scanning it all.
+            size_t best = 0;
+            double best_diff = std::numeric_limits<double>::max();
+            for (size_t i = 0; i < queue_.size(); i++) {
+                double diff = std::fabs(queue_[i].time - select_target);
+                if (diff < best_diff) {
+                    best_diff = diff;
+                    best = i;
+                } else {
+                    break;
+                }
+            }
             if (!queue_.empty()) {
-                chosen.frame = av_frame_clone(queue_.front().frame);
-                chosen_time  = queue_.front().time;
+                chosen.frame = av_frame_clone(queue_[best].frame);
+                chosen_time  = queue_[best].time;
             } else {
                 starved = true;
             }
@@ -785,7 +813,7 @@ void Player::feed_loop()
             continue;
         }
 
-        double error = chosen_time - target;
+        double error = chosen_time - select_target;
         last_error_.store(error);
 
         // Skip the first stretch so the startup transient stays out of the
@@ -814,10 +842,10 @@ void Player::feed_loop()
                     std::this_thread::sleep_for(std::chrono::milliseconds(2));
                 continue;
             }
-            log_debug("player: %.3fs out of sync — reseeking to %.3f", error, target);
+            log_debug("player: %.3fs out of sync — reseeking to %.3f", error, select_target);
             last_reseek_ = now;
             reseeks_++;
-            request_seek(target);
+            request_seek(select_target);
             output_->resync();
             phase_ = 0.0;
             last_frame_time_.store(-1.0);

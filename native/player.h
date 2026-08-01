@@ -68,7 +68,6 @@ public:
     // simply the truth. See the commentary in player.cpp.
     void update(double position, double speed, bool paused);
     void reset(double position, double speed, bool paused);
-    void set_paused(bool paused);
     double position() const;
     // Elapsed real (output/wall-clock) time since the clock was first
     // anchored — source time with playback speed's effect removed, which is
