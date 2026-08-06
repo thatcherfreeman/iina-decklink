@@ -204,7 +204,15 @@ static bool target_is_rgb(int dlk_pixfmt)
 Converter::~Converter()
 {
     if (sws_)
-        sws_freeContext(sws_);
+        sws_free_context(&sws_);
+    if (src_wrap_) {
+        // Never owned the pixels it pointed at — clear the borrowed pointers
+        // so freeing the wrapper can't be mistaken for freeing a frame.
+        for (int p = 0; p < 4; p++)
+            src_wrap_->data[p] = nullptr;
+        src_wrap_->extended_data = src_wrap_->data;
+        av_frame_free(&src_wrap_);
+    }
     if (canvas_)
         av_frame_free(&canvas_);
     if (scaled_)
@@ -259,12 +267,20 @@ bool Converter::configure(const SourceInfo &src, int out_w, int out_h, int pixfm
     direct_to_canvas_ = (dst_w_ == out_w && dst_h_ == out_h &&
                          dst_x_ == 0 && dst_y_ == 0);
 
-    if (sws_) {
-        sws_freeContext(sws_);
-        sws_ = nullptr;
+    if (sws_)
+        sws_free_context(&sws_);
+
+    // The wrapper that hands each source frame to the scaler.  Allocated once
+    // and refilled per frame; it borrows the mapped pixels rather than owning
+    // them, so it never carries an AVBufferRef.
+    if (!src_wrap_) {
+        src_wrap_ = av_frame_alloc();
+        if (!src_wrap_) {
+            if (err)
+                *err = "out of memory";
+            return false;
+        }
     }
-    sws_src_fmt_   = AV_PIX_FMT_NONE;
-    sws_src_range_ = -1;
 
     if (!build_canvas(err))
         return false;
@@ -407,11 +423,17 @@ bool Converter::convert(const AVFrame *frame, std::string *err)
     int src_range = view.range == AVCOL_RANGE_JPEG ? 1 : 0;
     offset_view(&view, crop_x_, crop_y_);
 
-    // Rebuild the scaler if the source layout changed — which it does exactly
-    // once in practice, on the first frame.
-    if (!sws_ || sws_src_fmt_ != view.format || sws_src_range_ != src_range) {
-        if (sws_)
-            sws_freeContext(sws_);
+    // Built once and then left alone.  This is swscale's dynamic mode: frame
+    // properties come from the frames themselves on every call, so a source
+    // whose layout or range changes mid-playback needs no rebuild — the case
+    // the old explicitly-initialised context had to watch for.
+    if (!sws_) {
+        sws_ = sws_alloc_context();
+        if (!sws_) {
+            if (err)
+                *err = "could not create scaler";
+            return false;
+        }
         // SWS_FULL_CHR_H_IN{T,P} matter specifically for a subsampled source
         // going to a non-subsampled RGB target (4:2:0 → 4:4:4, our biggest
         // chroma upsample): without them swscale takes a cheaper chroma path
@@ -439,35 +461,55 @@ bool Converter::convert(const AVFrame *frame, std::string *err)
         int flags = SWS_BICUBLIN;
         if (target_is_rgb(pixfmt_))
             flags |= SWS_FULL_CHR_H_INT | SWS_FULL_CHR_H_INP | SWS_ACCURATE_RND;
-        sws_ = sws_getContext(crop_w_, crop_h_, view.format,
-                              dst_w_, dst_h_, target_,
-                              flags, nullptr, nullptr, nullptr);
-        if (!sws_) {
-            if (err)
-                *err = "could not create scaler";
-            return false;
-        }
-        sws_src_fmt_   = view.format;
-        sws_src_range_ = src_range;
+        sws_->flags = flags;
 
-        // Both sides get the source's own coefficients, so a YUV→YUV
-        // conversion applies no matrix at all.  Output range follows the
-        // Video/Full setting for YUV; RGB output is written full-range here
-        // and scaled to legal by the shim during packing, since swscale has no
-        // legal-range RGB.
-        const int cs = sws_colorspace_for(src_);
-        int dst_range = target_is_rgb(pixfmt_) ? 1 : (full_range_ ? 1 : 0);
-        if (sws_setColorspaceDetails(sws_, sws_getCoefficients(cs), src_range,
-                                     sws_getCoefficients(cs), dst_range,
-                                     0, 1 << 16, 1 << 16) < 0) {
-            log_debug("converter: scaler rejected explicit colorspace details");
-        }
+        // Slice threading, which is the whole reason this uses the dynamic
+        // API: the legacy sws_scale() entry point ignores this field, and
+        // single-threaded it could not upscale 1080p to a 4K RGB canvas in
+        // real time.  Measured on the 1920x1080 NV12 → 3840x2160 X2RGB10LE
+        // conversion, against a 41.7 ms budget at 23.976 fps: 52.0 ms at one
+        // thread, 26.6 at two, 13.8 at four, 7.6 at eight — and byte-for-byte
+        // identical output at every count, since only the slice division
+        // changes.  0 lets swscale size the pool to the machine (9.7 ms here,
+        // on ten cores), which is the right default when the decoder may also
+        // be competing for cores on a software-decode source.
+        sws_->threads = 0;
     }
 
+    // Dynamic mode takes colour properties from the frames rather than from
+    // sws_setColorspaceDetails().  Both sides get the source's own
+    // coefficients, so a YUV→YUV conversion applies no matrix at all.  Output
+    // range follows the Video/Full setting for YUV; RGB output is written
+    // full-range here and scaled to legal by the shim during packing, since
+    // swscale has no legal-range RGB.
+    const int cs = sws_colorspace_for(src_);
+
+    AVFrame *s = src_wrap_;
+    s->format = view.format;
+    s->width  = crop_w_;
+    s->height = crop_h_;
+    for (int p = 0; p < 4; p++) {
+        s->data[p]     = const_cast<uint8_t *>(view.data[p]);
+        s->linesize[p] = view.linesize[p];
+    }
+    s->extended_data = s->data;
+    s->colorspace  = (AVColorSpace)cs;
+    s->color_range = src_range ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
+
     AVFrame *dst = direct_to_canvas_ ? canvas_ : scaled_;
-    int rc = sws_scale(sws_, view.data, view.linesize, 0, crop_h_,
-                       dst->data, dst->linesize);
-    if (rc <= 0) {
+    dst->colorspace  = (AVColorSpace)cs;
+    dst->color_range = (target_is_rgb(pixfmt_) || full_range_) ? AVCOL_RANGE_JPEG
+                                                               : AVCOL_RANGE_MPEG;
+
+    // Primaries and transfer are copied across unchanged, deliberately.  This
+    // mode *will* convert between them when the two sides disagree — it would
+    // happily tone-map a PQ/BT.2020 source down to whatever it thought the
+    // canvas was — and never acting on them is what lets HDR material reach
+    // the card with its original code values.  Matching them makes it a no-op.
+    s->color_primaries = dst->color_primaries = src_.primaries;
+    s->color_trc       = dst->color_trc       = src_.transfer;
+
+    if (sws_scale_frame(sws_, dst, s) < 0) {
         if (err)
             *err = "scaling failed";
         return false;

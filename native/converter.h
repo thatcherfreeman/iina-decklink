@@ -125,9 +125,10 @@ private:
     bool       full_range_ = false;
     SourceInfo src_;
 
+    // Used in swscale's dynamic mode, so it needs no rebuild when the source
+    // layout changes and carries no record of what it was built for.
     SwsContext *sws_ = nullptr;
-    AVPixelFormat sws_src_fmt_ = AV_PIX_FMT_NONE;  // what sws_ was built for
-    int         sws_src_range_ = -1;
+    AVFrame *src_wrap_ = nullptr;  // borrows the mapped source pixels
 
     AVFrame *canvas_ = nullptr;  // out_w_ x out_h_, target_ format
     AVFrame *scaled_ = nullptr;  // dst_w_ x dst_h_, target_ format
