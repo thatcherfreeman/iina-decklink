@@ -68,6 +68,28 @@ test_still() {
 }
 check "grab still" test_still
 
+# The watchdog, via --null-stall: a simulated card that stops retiring frames,
+# which is what a DeckLink that has gone away looks like to the feed loop.  This
+# is the one piece of the helper that by definition only runs when something has
+# already gone wrong, so it would otherwise never be exercised until the day it
+# is needed — and a watchdog that is silent then is worse than none.
+test_watchdog() {
+    local log="$TMP/watchdog.log"
+    rm -f "$log"
+    # Wedges at 1s, runs to 4s: long enough for the 1s stall threshold to fire
+    # and be reported, short enough not to slow the suite down.
+    "$HELPER" --play "$CLIP" --null-stall 1 --duration 4 --log "$log" \
+        >/dev/null 2>&1 || return 1
+    [[ -s "$log" ]] || { echo "    no log file was written" >&2; return 1; }
+    grep -q "the card has refused frames" "$log" || {
+        echo "    the stall was never reported" >&2; return 1; }
+    # The heartbeat has to reach the file without --verbose, or a real dropout
+    # leaves nothing to compare the stall against.
+    grep -q "\[debug\] player: pos=" "$log" || {
+        echo "    no health heartbeats in the log file" >&2; return 1; }
+}
+check "watchdog reports a wedged card" test_watchdog
+
 # --dump: the canvas/padding path (broadcast-black fill, framing/scale),
 # independent of any DeckLink or FFmpeg output plumbing.
 test_dump() {

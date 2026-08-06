@@ -89,6 +89,30 @@ void DeckLinkOutput::resync()
         dlk_output_resync(out_);
 }
 
+OutputHealth DeckLinkOutput::health()
+{
+    OutputHealth h;
+    if (!out_)
+        return h;
+    dlk_health raw;
+    dlk_output_get_health(out_, &raw);
+    h.frames_in_flight = raw.frames_in_flight;
+    h.inflight_limit   = raw.inflight_limit;
+    h.buffered_video   = raw.buffered_video;
+    h.buffered_audio   = raw.buffered_audio;
+    h.stream_time      = raw.stream_time;
+    h.scheduled        = raw.scheduled;
+    h.completed        = raw.completed;
+    h.late             = raw.late;
+    h.dropped          = raw.dropped;
+    h.flushed          = raw.flushed;
+    h.schedule_errors  = raw.schedule_errors;
+    h.audio_errors     = raw.audio_errors;
+    h.last_error       = raw.last_error;
+    h.playback_stopped = raw.playback_stopped != 0;
+    return h;
+}
+
 // ---------------------------------------------------------------------------
 // NullOutput
 // ---------------------------------------------------------------------------
@@ -153,6 +177,7 @@ bool NullOutput::open(const OutputOpenParams &p, std::string *err)
     info_.audio     = p.enable_audio;
 
     inflight_limit_ = (p.preroll > 0 ? p.preroll : 3) * 2;
+    stall_after_    = p.stall_after;
     scheduled_      = 0;
     cadence_.clear();
     log_.clear();
@@ -160,6 +185,9 @@ bool NullOutput::open(const OutputOpenParams &p, std::string *err)
 
     log_info("null output: %dx%d @ %.3f fps (simulated)",
              info_.width, info_.height, info_.fps);
+    if (stall_after_ > 0.0)
+        log_info("null output: will stop consuming frames after %.1fs, to "
+                 "exercise the feed loop's watchdog", stall_after_);
     return true;
 }
 
@@ -175,6 +203,11 @@ int64_t NullOutput::consumed() const
 {
     double elapsed =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start_).count();
+    // The simulated wedge: time stops for the card, so the frames already
+    // scheduled are never retired and nothing further is ever accepted —
+    // exactly what a DeckLink that has gone away looks like from this side.
+    if (stall_after_ > 0.0 && elapsed > stall_after_)
+        elapsed = stall_after_;
     return (int64_t)(elapsed * info_.fps);
 }
 
@@ -255,6 +288,23 @@ void NullOutput::resync()
 {
     std::lock_guard<std::mutex> guard(mutex_);
     scheduled_ = consumed() + 2;
+}
+
+// The simulated card can't lose a connection, so this exists to keep the
+// watchdog exercisable with no hardware: it reports the same shape, with the
+// two quantities the simulation actually models.
+OutputHealth NullOutput::health()
+{
+    OutputHealth h;
+    std::lock_guard<std::mutex> guard(mutex_);
+    int64_t in_flight = scheduled_ - consumed();
+    h.frames_in_flight = in_flight > 0 ? (int)in_flight : 0;
+    h.inflight_limit   = inflight_limit_;
+    h.buffered_video   = h.frames_in_flight;
+    h.stream_time      = (double)consumed() / (info_.fps > 0.0 ? info_.fps : 30.0);
+    h.scheduled        = (int64_t)log_.size();
+    h.completed        = (int64_t)consumed();
+    return h;
 }
 
 std::vector<NullOutput::ScheduleEntry> NullOutput::schedule_log() const

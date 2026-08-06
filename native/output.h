@@ -36,6 +36,12 @@ struct OutputOpenParams {
     // pulldown cadences can be exercised without hunting for a device that
     // lacks the source's own frame rate.
     double force_fps    = 0.0;
+    // Test hook, honoured only by NullOutput: this many seconds after opening,
+    // stop consuming frames — the simulated card wedges with its queue full and
+    // never retires another frame.  This is the fault the feed loop's watchdog
+    // exists to report, and the only way to exercise that reporting without
+    // waiting for real hardware to do it.
+    double stall_after  = 0.0;
 };
 
 struct OutputInfo {
@@ -45,6 +51,27 @@ struct OutputInfo {
     std::string mode_code;
     int    pixfmt = 0;   // as negotiated; may differ from what was requested
     bool   audio  = false;
+};
+
+// What the card says about itself, for the feed loop's watchdog.  Mirrors
+// dlk_health (see decklink_shim.h for what each counter distinguishes);
+// NullOutput fills in the few it can answer honestly and leaves the rest zero,
+// so the watchdog code is the same either way.
+struct OutputHealth {
+    int     frames_in_flight = 0;
+    int     inflight_limit   = 0;
+    int     buffered_video   = 0;     // -1 if the driver wouldn't say
+    int     buffered_audio   = 0;
+    double  stream_time      = -1.0;  // hardware clock, seconds; -1 if unavailable
+    int64_t scheduled        = 0;
+    int64_t completed        = 0;
+    int64_t late             = 0;
+    int64_t dropped          = 0;
+    int64_t flushed          = 0;
+    int64_t schedule_errors  = 0;
+    int64_t audio_errors     = 0;
+    int32_t last_error       = 0;
+    bool    playback_stopped = false;
 };
 
 class VideoOutput {
@@ -74,6 +101,9 @@ public:
     virtual int  send_audio(const int32_t *interleaved, int nframes) = 0;
     virtual int  buffered_audio_frames() = 0;
     virtual void resync() = 0;
+    // A snapshot of whatever the output can say about its own state.  Cheap
+    // enough to take once a second from the feed loop; see OutputHealth.
+    virtual OutputHealth health() = 0;
 };
 
 // The real card.
@@ -93,6 +123,7 @@ public:
     int  send_audio(const int32_t *interleaved, int nframes) override;
     int  buffered_audio_frames() override;
     void resync() override;
+    OutputHealth health() override;
 
 private:
     dlk_output *out_ = nullptr;
@@ -117,6 +148,7 @@ public:
     int  send_audio(const int32_t *interleaved, int nframes) override;
     int  buffered_audio_frames() override;
     void resync() override;
+    OutputHealth health() override;
 
     // Sample frames handed over, and how many of those were silence.  The
     // simulated card accepts everything; these exist so the audio path is
@@ -148,6 +180,7 @@ private:
 
     mutable std::mutex mutex_;
     OutputInfo info_;
+    double  stall_after_    = 0.0;   // see OutputOpenParams::stall_after
     int     inflight_limit_ = 6;
     int64_t scheduled_      = 0;
     int64_t audio_frames_   = 0;

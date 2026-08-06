@@ -39,7 +39,7 @@ extern "C" {
 
 typedef struct dlk_output dlk_output;
 
-/* level: 0 = error, 1 = info, 2 = debug. */
+/* level: 0 = error, 1 = info, 2 = debug, 3 = warning. */
 typedef void (*dlk_log_fn)(int level, const char *msg);
 void dlk_set_log_callback(dlk_log_fn fn);
 
@@ -117,6 +117,40 @@ int dlk_output_buffered_audio_frames(dlk_output *d);
 
 /* Hardware playback position in seconds since playback started, or -1. */
 double dlk_output_stream_time(dlk_output *d);
+
+/*
+ * Everything the card will tell us about its own state, for the watchdog.
+ *
+ * A DeckLink that stops taking frames doesn't announce it: scheduling keeps
+ * "succeeding" while the completion callback goes quiet, so the in-flight count
+ * pins at its limit and the feed loop backs off forever.  These counters are
+ * what distinguishes that from the several other things that look identical
+ * from outside — the driver flushing the queue, playback having been stopped
+ * underneath us, the hardware clock frozen, or scheduling failing outright with
+ * an HRESULT nobody was looking at.
+ */
+struct dlk_health {
+    int      frames_in_flight;   /* scheduled and not yet retired            */
+    int      inflight_limit;     /* the backpressure ceiling                 */
+    int      buffered_video;     /* as the driver reports it; -1 if it failed */
+    int      buffered_audio;     /* -1 if the query failed                   */
+    double   stream_time;        /* hardware clock, seconds; -1 if it failed */
+    int64_t  scheduled;          /* frames handed to ScheduleVideoFrame      */
+    /* Completion results, as the callback saw them.  `late` and `dropped`
+     * mean the card ran out of frames on time; `flushed` means the driver
+     * threw away what was queued, which is what a mode/profile change or a
+     * device reset looks like from here. */
+    int64_t  completed;
+    int64_t  late;
+    int64_t  dropped;
+    int64_t  flushed;
+    int64_t  schedule_errors;    /* ScheduleVideoFrame failures              */
+    int64_t  audio_errors;       /* ScheduleAudioSamples failures            */
+    int32_t  last_error;         /* HRESULT of the most recent failure       */
+    int      playback_stopped;   /* ScheduledPlaybackHasStopped has fired    */
+};
+
+void dlk_output_get_health(dlk_output *d, struct dlk_health *h);
 
 /* Re-anchors the schedule just ahead of the hardware clock.  Call after a
  * pause, seek, or underrun, otherwise frames scheduled in the past flush out

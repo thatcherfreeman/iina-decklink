@@ -19,13 +19,17 @@
  *                               RGB TIFF (what "Grab Still" sends the helper)
  *
  * Logs go to stderr, which the plugin captures via utils.exec's stderrHook and
- * forwards to IINA's log window.  stdout carries JSON only.
+ * forwards to IINA's log window.  stdout carries JSON only.  --log additionally
+ * appends everything, debug lines included, to a file: IINA's log window is
+ * in-memory and per-session, which makes it useless for the faults worth
+ * diagnosing — the intermittent ones nobody is watching for when they happen.
  */
 
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <unistd.h>
 #include <chrono>
 #include <cmath>
 #include <string>
@@ -560,12 +564,18 @@ static void usage(void)
         "                                (pitch-preserving away from 1.0)\n"
         "  --null                       simulate the card instead of opening one\n"
         "  --null-fps N                 pin the simulated mode rate (implies --null)\n"
+        "  --null-stall SECONDS         wedge the simulated card this far in, to\n"
+        "                                exercise the watchdog (implies --null)\n"
         "  --out PATH                   output path for --dump (default canvas.ppm) or\n"
         "                                --still (default still.tiff)\n"
         "  --raw PATH                   also write the canvas in its native layout\n"
         "  --at SECONDS                 timestamp for --dump or --still (default 0)\n"
         "  --size WxH                   canvas size for --dump (default 1920x1080)\n"
-        "  --verbose                    include debug logging\n");
+        "  --verbose                    include debug logging on stderr\n"
+        "  --log PATH                   also append every line, debug included,\n"
+        "                                to PATH (rotated at 4 MB).  The plugin\n"
+        "                                passes its own; $IINA_DECKLINK_LOG is\n"
+        "                                used when neither does\n");
 }
 
 int main(int argc, char **argv)
@@ -576,6 +586,7 @@ int main(int argc, char **argv)
     const char *command = nullptr;
     const char *cmd_arg = nullptr;
     const char *connect_url = nullptr;
+    const char *log_path = getenv("IINA_DECKLINK_LOG");
     DumpOptions dump;
     OutputConfig cfg;
     double play_duration = 0.0;
@@ -686,6 +697,11 @@ int main(int argc, char **argv)
             if (!need_value(&v)) return 2;
             cfg.null_output = true;
             cfg.null_fps = atof(v);
+        } else if (!strcmp(a, "--null-stall")) {
+            const char *v = nullptr;
+            if (!need_value(&v)) return 2;
+            cfg.null_output = true;
+            cfg.null_stall = atof(v);
         } else if (!strcmp(a, "--servo-gain")) {
             const char *v = nullptr;
             if (!need_value(&v)) return 2;
@@ -696,6 +712,8 @@ int main(int argc, char **argv)
             cfg.servo_deadband = atof(v);
         } else if (!strcmp(a, "--verbose")) {
             log_set_verbose(true);
+        } else if (!strcmp(a, "--log")) {
+            if (!need_value(&log_path)) return 2;
         } else if (!strncmp(a, "--", 2)) {
             command = a;
             // These commands take the media path as their argument.
@@ -714,6 +732,20 @@ int main(int argc, char **argv)
     if (!command) {
         usage();
         return 2;
+    }
+
+    // Opened before anything else runs, so a failure to open the device is in
+    // the file too.  Each session starts with the command line that produced
+    // it: which device, which mode, which pixel format and whether audio was on
+    // are the first questions any dropout report raises.
+    if (log_path && log_path[0] && log_set_file(log_path)) {
+        std::string command_line;
+        for (int i = 0; i < argc; i++) {
+            command_line += (i ? " " : "");
+            command_line += argv[i];
+        }
+        log_info("iina-decklink-helper 0.1.0 starting (pid %d): %s",
+                 (int)getpid(), command_line.c_str());
     }
 
     if (!strcmp(command, "--list-devices"))

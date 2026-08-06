@@ -16,10 +16,23 @@ let path = "@data/decklink.log";
 let buffer = "";
 let broken = false;
 
+// Rewriting the whole buffer per line is quadratic in the number of lines, so
+// the buffer is capped and the oldest lines fall off the front. A handful of
+// lines a session never reaches this; a session where the helper is reporting
+// a fault every few seconds for hours does, and that is exactly the session
+// whose tail is worth keeping. The helper's own log (@data/helper.log) is
+// appended to rather than rewritten and holds the detailed record.
+const MAX_BUFFER = 256 * 1024;
+
 function emit(level, text) {
   const line = `${new Date().toISOString()} [${level}] ${text}`;
   if (!broken) {
     buffer += line + "\n";
+    if (buffer.length > MAX_BUFFER) {
+      // Trim to a line boundary so the file never opens mid-line.
+      const cut = buffer.indexOf("\n", buffer.length - MAX_BUFFER);
+      buffer = buffer.slice(cut < 0 ? buffer.length - MAX_BUFFER : cut + 1);
+    }
     try {
       iina.file.write(path, buffer);
     } catch (e) {

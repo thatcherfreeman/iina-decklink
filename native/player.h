@@ -53,6 +53,10 @@ struct OutputConfig {
     HwMode  hw             = HwMode::Auto;
     bool    null_output    = false;  // simulate the card, for testing
     double  null_fps       = 0.0;    // pin the simulated mode rate
+    // Simulated card only: wedge it this many seconds in, so the watchdog's
+    // reporting of a card that has stopped retiring frames can be exercised
+    // with no hardware.  See OutputOpenParams::stall_after.
+    double  null_stall     = 0.0;
     // Servo tuning, exposed so the constants can be compared against measured
     // behaviour rather than guessed at.  Zero means "use the default".
     double  servo_gain     = 0.0;
@@ -131,6 +135,18 @@ struct PlayerStatus {
     int64_t audio_frames  = 0;
     int64_t audio_silence = 0;
     int64_t audio_resyncs = 0;
+    // What the card is doing to the frames it is given, sampled by the feed
+    // loop's watchdog.  These exist because a DeckLink that has stopped
+    // accepting frames looks, from every other number here, exactly like one
+    // that is working: the feed loop simply stops being allowed to send, and
+    // position, error and drop counts all freeze at whatever they last were.
+    bool    stalled        = false;  // the card has refused frames for seconds
+    bool    playback_stopped = false;  // the card ended scheduled playback
+    int64_t send_failures  = 0;      // frames the output refused outright
+    int64_t card_late      = 0;      // frames the card displayed late
+    int64_t card_dropped   = 0;      // frames the card never displayed
+    int64_t card_flushed   = 0;      // frames the driver threw away
+    int64_t card_errors    = 0;      // scheduling calls that returned a failure
 };
 
 class Player {
@@ -198,6 +214,16 @@ private:
     // Clones `frame` for grab_still() to find later. Called by the feed loop
     // right after a native frame is converted onto the canvas.
     void update_still_frame(const AVFrame *frame);
+
+    // Called once per pass of the feed loop with whether the card would accept
+    // a frame right now.  Records a periodic health line and, more to the
+    // point, notices the failure this whole path exists for: the card quietly
+    // ceasing to retire frames, which stalls the feed loop indefinitely with
+    // nothing anywhere else to show for it.  See player.cpp.
+    void feed_watchdog(bool can_send);
+    // One line describing where the card is, for the watchdog's own use and
+    // for the summary written when playback stops.
+    std::string health_line(const OutputHealth &h) const;
 
     struct QueuedFrame {
         AVFrame *frame = nullptr;
@@ -283,6 +309,25 @@ private:
     // When the last re-anchor happened, so the feed loop doesn't stack more of
     // them while the decoder is still working through the first.
     std::chrono::steady_clock::time_point last_reseek_{};
+
+    // --- watchdog -----------------------------------------------------------
+    // Written only by the feed thread; the atomics below are the part status()
+    // reads from the control thread.  status() deliberately doesn't sample the
+    // card itself: stop() can free the output between the two, and a diagnostic
+    // is not worth a race.
+    std::chrono::steady_clock::time_point wd_heartbeat_{};
+    std::chrono::steady_clock::time_point wd_stall_since_{};
+    std::chrono::steady_clock::time_point wd_stall_logged_{};
+    bool         wd_stalled_      = false;
+    bool         wd_have_last_    = false;
+    OutputHealth wd_last_;         // the previous heartbeat's snapshot, for deltas
+    std::atomic<int64_t> send_failures_{0};
+    std::atomic<bool>    card_stalled_{false};
+    std::atomic<bool>    card_playback_stopped_{false};
+    std::atomic<int64_t> card_late_{0};
+    std::atomic<int64_t> card_dropped_{0};
+    std::atomic<int64_t> card_flushed_{0};
+    std::atomic<int64_t> card_errors_{0};
 };
 
 #endif  // IINA_DECKLINK_PLAYER_H

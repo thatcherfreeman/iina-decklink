@@ -61,3 +61,29 @@ A few things worth knowing:
   silent black screen.
 - This works with local files. Network streams are passed straight to the
   decoder, so anything that can't be opened twice at once won't work here.
+
+## If the picture drops out
+
+The output occasionally stops reaching the monitor and doesn't come back on its
+own. Toggling **Send to DeckLink** off and on reopens the card, which is the way
+back for now — but before you do, the useful thing is what got recorded while it
+was happening:
+
+- **Plugin → Reveal DeckLink Logs…** opens the folder holding both logs.
+  `helper.log` is the detailed one: it records the card's own state every five
+  seconds, and says explicitly when the card stops accepting frames, when the
+  driver flushes what was queued, and when scheduled playback ends. It survives
+  quitting IINA and rotates at 4 MB, so the record from an hour ago is still
+  there. `decklink.log` is the plugin's side of the same session.
+- IINA's **Log Viewer** (Window → Log Viewer, with the log level at Debug) shows
+  the same events live, if you happen to be watching when it goes.
+
+Attaching `helper.log` to a bug report is the single most useful thing you can
+do. The lines to look for read like:
+
+```
+[error] player: the card has refused frames for 1.0s (paused=0 blackout=0) — inflight=6/6 …
+```
+
+with the heartbeats on either side of it showing whether the counters (`done`,
+`stream`) were still moving.

@@ -27,6 +27,12 @@ function randomPort() {
   return 49152 + Math.floor(Math.random() * 16000);
 }
 
+// Where the helper writes its own log. Beside the plugin's, so "reveal the
+// logs" is one folder, and inside @data so it goes away with the plugin.
+function helperLogPath() {
+  return utils.resolvePath("@data/helper.log");
+}
+
 function findHelper(settings) {
   const candidates = [settings.helperPath, HELPER_RELATIVE].filter(Boolean);
   for (const candidate of candidates) {
@@ -135,14 +141,22 @@ class HelperLink {
 
   _launchHelper() {
     const url = `ws://127.0.0.1:${this.port}/`;
-    console.log(`launching helper: ${this.helper} --connect ${url}`);
+    // The helper keeps its own log, rather than relying on the lines it sends
+    // back over stderr. Those land in IINA's Log Viewer, which is in-memory and
+    // per-session — gone by the time anyone notices the output dropped out —
+    // and this plugin's own file rewrites itself whole on every line, so it
+    // can't carry a per-second health record. The helper appends to its file
+    // directly and rotates it, and that file is what an intermittent dropout
+    // gets diagnosed from.
+    const args = ["--connect", url, "--log", helperLogPath()];
+    console.log(`launching helper: ${this.helper} ${args.join(" ")}`);
 
     // This promise doesn't settle until the helper exits, which is exactly how
     // the exit is detected — there is no other signal available.
     utils
       .exec(
         this.helper,
-        ["--connect", url],
+        args,
         null,
         (out) => {
           if (out.trim() && this.handlers.onLog) this.handlers.onLog(out.trim());
@@ -320,6 +334,7 @@ function listModes(settings, device, link) {
 module.exports = {
   HelperLink,
   findHelper,
+  helperLogPath,
   downloadHelper,
   listDevices,
   listModes,

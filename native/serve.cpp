@@ -288,16 +288,28 @@ void Session::tick_status()
         return;
 
     PlayerStatus s = player_.status();
-    char buf[512];
+    char buf[768];
+    // The card-health fields ride along on the status the plugin already
+    // receives every second: it is the only channel that reaches IINA's side,
+    // and a dropout the helper notices should leave a mark in the plugin's own
+    // log too, not just in the helper's.
     snprintf(buf, sizeof(buf),
              "{\"event\":\"status\",\"position\":%.3f,\"error_ms\":%.1f,"
              "\"dropped\":%lld,\"repeated\":%lld,\"reseeks\":%lld,"
              "\"audio\":%s,\"audio_frames\":%lld,\"audio_silence\":%lld,"
-             "\"audio_resyncs\":%lld}",
+             "\"audio_resyncs\":%lld,"
+             "\"stalled\":%s,\"playback_stopped\":%s,\"send_failures\":%lld,"
+             "\"card_late\":%lld,\"card_dropped\":%lld,\"card_flushed\":%lld,"
+             "\"card_errors\":%lld}",
              s.position, s.error_ms, (long long)s.dropped,
              (long long)s.repeated, (long long)s.reseeks,
              s.audio ? "true" : "false", (long long)s.audio_frames,
-             (long long)s.audio_silence, (long long)s.audio_resyncs);
+             (long long)s.audio_silence, (long long)s.audio_resyncs,
+             s.stalled ? "true" : "false",
+             s.playback_stopped ? "true" : "false",
+             (long long)s.send_failures, (long long)s.card_late,
+             (long long)s.card_dropped, (long long)s.card_flushed,
+             (long long)s.card_errors);
     send_event(buf);
 }
 
@@ -328,6 +340,15 @@ int run_serve(const std::string &url, const OutputConfig &defaults)
             break;
         }
     }
+
+    // Which of the three ways out this was, so the log distinguishes an
+    // ordinary quit from the socket dropping underneath a session that was
+    // still playing — they look identical from IINA's side, where both are
+    // simply the helper's exec resolving.
+    if (session.should_quit())
+        log_info("the plugin asked the helper to quit");
+    else if (!ws.connected())
+        log_warn("the control connection to the plugin closed");
 
     ws.stop();
     log_info("helper exiting");

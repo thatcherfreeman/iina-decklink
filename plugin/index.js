@@ -17,11 +17,12 @@ try {
   iina.console.error(`could not load the log module: ${e}`);
 }
 
-let Settings, HelperLink, listDevices, listModes, findHelper, downloadHelper;
+let Settings, HelperLink, listDevices, listModes, findHelper, downloadHelper,
+  helperLogPath;
 try {
   Settings = require("./settings-lib.js");
-  ({ HelperLink, listDevices, listModes, findHelper, downloadHelper } =
-    require("./helper-lib.js"));
+  ({ HelperLink, listDevices, listModes, findHelper, downloadHelper,
+     helperLogPath } = require("./helper-lib.js"));
 } catch (e) {
   console.error(`could not load the plugin's modules: ${e}`);
   throw e;
@@ -122,6 +123,42 @@ function loadCurrentMedia() {
   });
 }
 
+// The helper reports the card's state on every status message; this turns the
+// transitions into log lines and one OSD, so a dropout leaves a mark on IINA's
+// side with a timestamp the user can match against what they saw. The running
+// totals stay out of the log — @data/helper.log has those, once a second — and
+// only changes are recorded here.
+//
+// A stall does not stop playback in IINA, and there is nothing this plugin can
+// do about it, so the OSD is a notification and not a prompt: the user is the
+// one who has to decide whether to toggle the output off and on again.
+function noteHealthChange(before, now) {
+  if (!now) return;
+  const was = before || {};
+
+  if (now.stalled && !was.stalled) {
+    console.error(
+      "the DeckLink stopped accepting frames — see helper.log for the card's " +
+        "own counters at the moment it happened",
+    );
+    core.osd("DeckLink: the card stopped accepting frames");
+  } else if (!now.stalled && was.stalled) {
+    console.log("the DeckLink started accepting frames again");
+  }
+
+  if (now.playback_stopped && !was.playback_stopped)
+    console.error("the DeckLink ended scheduled playback; it has to be reopened");
+
+  for (const [key, what] of [
+    ["card_errors", "scheduling calls the card refused"],
+    ["card_flushed", "frames the driver flushed"],
+    ["send_failures", "frames the output refused"],
+  ]) {
+    const delta = (now[key] || 0) - (was[key] || 0);
+    if (delta > 0) console.warn(`${delta} ${what} in the last second`);
+  }
+}
+
 function handleHelperEvent(message) {
   switch (message.event) {
     case "ready":
@@ -148,6 +185,7 @@ function handleHelperEvent(message) {
       break;
 
     case "status":
+      noteHealthChange(lastStatus, message);
       lastStatus = message;
       break;
 
@@ -210,10 +248,23 @@ function startOutput() {
       loadedPath = null;   // the next helper starts knowing nothing
       stopTicker();
       if (wasRunning) {
-        console.warn(`helper exited unexpectedly (status ${status})`);
+        // The helper only exits on its own if it crashed or its control
+        // connection went away, and either explains a picture that vanished —
+        // so record what the card was last reported to be doing alongside it.
+        console.warn(
+          `helper exited unexpectedly (status ${status})` +
+            (lastStatus
+              ? `; last status: position ${lastStatus.position}, ` +
+                `stalled ${!!lastStatus.stalled}, ` +
+                `card errors ${lastStatus.card_errors || 0}`
+              : "; it never reported a status"),
+        );
         core.osd("DeckLink: output stopped");
         setEnabled(false);
+      } else {
+        console.log(`helper exited (status ${status})`);
       }
+      lastStatus = null;
     },
   });
 
@@ -526,8 +577,27 @@ menu.addItem(
     core.osd(
       `DeckLink: ${lastStatus.error_ms.toFixed(1)}ms offset, ` +
         `${lastStatus.dropped} dropped, ${lastStatus.repeated} held, ` +
-        `${lastStatus.reseeks} reseeks${audio}`,
+        `${lastStatus.reseeks} reseeks${audio}` +
+        // Only when there is something wrong to report: on a healthy feed
+        // these are all zero and saying so every time buries the numbers that
+        // do move.
+        (lastStatus.stalled ? ", CARD STALLED" : "") +
+        (lastStatus.card_errors ? `, ${lastStatus.card_errors} card errors` : ""),
     );
+  }),
+);
+
+// The one way a user can get at the logs after a dropout: both files live in
+// the plugin's data folder, which is otherwise unreachable from IINA's UI.
+menu.addItem(
+  menu.item("Reveal DeckLink Logs…", () => {
+    const dir = utils.resolvePath("@data");
+    if (file.exists(dir)) {
+      file.showInFinder(dir);
+      console.log(`revealed the log folder: ${dir}`);
+    } else {
+      core.osd("DeckLink: no logs yet");
+    }
   }),
 );
 console.log("menu items registered");
@@ -614,4 +684,6 @@ if (settings.enabled) {
   });
 }
 
-console.log("DeckLink Output plugin loaded");
+// The helper's log path is recorded here so a bug report picked up from this
+// file alone still says where the other half of the record is.
+console.log(`DeckLink Output plugin loaded (helper log: ${helperLogPath()})`);

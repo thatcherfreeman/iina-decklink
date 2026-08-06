@@ -504,6 +504,21 @@ public:
     MallocVideoBuffer *fifo[FIFO_SIZE] = {};
     int head = 0, tail = 0;
 
+    // How each scheduled frame ended up.  Read by dlk_output_get_health under
+    // *lock; the watchdog reports the deltas, which is what distinguishes a
+    // card that is merely running late from one that has stopped retiring
+    // frames altogether (every counter frozen while scheduling continues).
+    std::atomic<int64_t> completed{0};
+    std::atomic<int64_t> late{0};
+    std::atomic<int64_t> dropped{0};
+    std::atomic<int64_t> flushed{0};
+    std::atomic<bool>    playback_stopped{false};
+    // Set by dlk_output_destroy before it stops playback itself, so the
+    // callback below can tell the teardown it asked for from the one the card
+    // decided on — they arrive through the same entry point, and only the
+    // second is a fault.
+    std::atomic<bool>    shutting_down{false};
+
     // Called under *lock from the feeder thread right after ScheduleVideoFrame.
     void push_inflight(MallocVideoBuffer *buf)
     {
@@ -512,23 +527,75 @@ public:
     }
 
     HRESULT STDMETHODCALLTYPE ScheduledFrameCompleted(
-        IDeckLinkVideoFrame *, BMDOutputFrameCompletionResult) override
+        IDeckLinkVideoFrame *, BMDOutputFrameCompletionResult result) override
     {
-        std::lock_guard<std::mutex> guard(*lock);
-        (*frames_in_flight)--;
-        // Frames complete in schedule order; retire the oldest buffer.
-        if (head < tail) {
-            MallocVideoBuffer *buf = fifo[head % FIFO_SIZE];
-            fifo[head % FIFO_SIZE] = nullptr;
-            head++;
-            buf->Release();
+        // Counted before the lock, and logged after it: this runs on
+        // DeckLink's own thread, and anything slow here delays the next
+        // frame's completion.
+        int64_t seen = 0;
+        const char *label = nullptr;
+        switch (result) {
+        case bmdOutputFrameDisplayedLate: seen = ++late;    label = "late";    break;
+        case bmdOutputFrameDropped:       seen = ++dropped; label = "dropped"; break;
+        case bmdOutputFrameFlushed:       seen = ++flushed; label = "flushed"; break;
+        default:                          ++completed;                         break;
         }
+
+        {
+            std::lock_guard<std::mutex> guard(*lock);
+            (*frames_in_flight)--;
+            // Frames complete in schedule order; retire the oldest buffer.
+            if (head < tail) {
+                MallocVideoBuffer *buf = fifo[head % FIFO_SIZE];
+                fifo[head % FIFO_SIZE] = nullptr;
+                head++;
+                buf->Release();
+            }
+        }
+
+        // The first of each kind, then powers of ten: a card that has gone
+        // wrong produces these at frame rate, and a log that scrolls at 60 Hz
+        // is as useless as no log at all.  The watchdog's periodic totals
+        // carry the rate; these carry the moment it started.
+        //
+        // Silent during teardown, where stopping playback flushes whatever was
+        // still queued: those completions are expected and reporting them would
+        // put a flush on the record at the end of every ordinary session.
+        if (label && !shutting_down && is_milestone(seen))
+            dlk_logf(3, "DeckLink: %lld frame%s %s by the card",
+                     (long long)seen, seen == 1 ? "" : "s", label);
         return S_OK;
     }
 
+    // The card telling us it has stopped playing back — which nothing else
+    // reports.  Scheduling keeps returning S_OK afterwards, so without this the
+    // symptom is simply that the monitor goes dark and every counter here looks
+    // ordinary.
+    //
+    // This also fires on every ordinary close, since that stops playback too;
+    // reporting those as faults would fill the log with false alarms on every
+    // file change, and a log nobody can trust is worse than no log.
     HRESULT STDMETHODCALLTYPE ScheduledPlaybackHasStopped() override
     {
+        if (shutting_down) {
+            dlk_logf(2, "DeckLink: scheduled playback stopped (closing)");
+            return S_OK;
+        }
+        playback_stopped = true;
+        dlk_logf(0, "DeckLink: the card stopped scheduled playback on its own — "
+                    "nothing further will reach the wire until the output is "
+                    "reopened");
         return S_OK;
+    }
+
+    static bool is_milestone(int64_t n)
+    {
+        if (n <= 0)
+            return false;
+        int64_t decade = 1;
+        while (decade < n)
+            decade *= 10;
+        return decade == n;
     }
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, LPVOID *ppv) override
@@ -569,6 +636,15 @@ struct dlk_output {
 
     std::mutex       lock;
     int              frames_in_flight = 0;
+
+    // Diagnostics, read back through dlk_output_get_health().  Failures on
+    // these paths used to be reported only as a false return the feed loop
+    // ignored, which is why a card that had gone away looked, from the log,
+    // exactly like one that was working.
+    std::atomic<int64_t> scheduled{0};        // ScheduleVideoFrame calls that succeeded
+    std::atomic<int64_t> schedule_errors{0};
+    std::atomic<int64_t> audio_errors{0};
+    std::atomic<int32_t> last_error{0};       // HRESULT of the most recent failure
 
     bool             audio_enabled = false;
     int              audio_channels = 2;
@@ -1196,6 +1272,10 @@ DLK_EXPORT void dlk_output_destroy(dlk_output *d)
     if (!d)
         return;
     if (d->output.valid()) {
+        // Before the stop, not after: the completion callback fires from
+        // DeckLink's thread and would otherwise report our own teardown as the
+        // card having quit underneath us.
+        d->callback.shutting_down = true;
         BMDTimeValue stop_time = 0;
         d->output.StopScheduledPlayback(0, &stop_time, d->time_scale);
         d->output.SetScheduledFrameCompletionCallback(nullptr);
@@ -1249,8 +1329,46 @@ DLK_EXPORT int dlk_output_can_send(dlk_output *d)
 DLK_EXPORT int dlk_output_buffered_video_frames(dlk_output *d)
 {
     uint32_t n = 0;
-    d->output.GetBufferedVideoFrameCount(&n);
+    if (d->output.GetBufferedVideoFrameCount(&n) != S_OK)
+        return 0;   // the feed loop treats this as a depth, so 0 is the safe answer
     return (int)n;
+}
+
+// Everything the watchdog needs, gathered in one pass so the numbers describe
+// the same instant.
+DLK_EXPORT void dlk_output_get_health(dlk_output *d, struct dlk_health *h)
+{
+    if (!d || !h)
+        return;
+    memset(h, 0, sizeof(*h));
+
+    uint32_t video = 0;
+    h->buffered_video = d->output.GetBufferedVideoFrameCount(&video) == S_OK
+                            ? (int)video : -1;
+    if (d->audio_enabled) {
+        uint32_t audio = 0;
+        h->buffered_audio = d->output.GetBufferedAudioSampleFrameCount(&audio) == S_OK
+                                ? (int)audio : -1;
+    }
+
+    BMDTimeValue t = 0;
+    double speed = 1.0;
+    h->stream_time = d->output.GetScheduledStreamTime(d->time_scale, &t, &speed) == S_OK
+                         ? (double)t / (double)d->time_scale : -1.0;
+
+    h->scheduled       = d->scheduled.load();
+    h->completed       = d->callback.completed.load();
+    h->late            = d->callback.late.load();
+    h->dropped         = d->callback.dropped.load();
+    h->flushed         = d->callback.flushed.load();
+    h->schedule_errors = d->schedule_errors.load();
+    h->audio_errors    = d->audio_errors.load();
+    h->last_error      = d->last_error.load();
+    h->playback_stopped = d->callback.playback_stopped.load() ? 1 : 0;
+    h->inflight_limit  = d->inflight_limit;
+
+    std::lock_guard<std::mutex> guard(d->lock);
+    h->frames_in_flight = d->frames_in_flight;
 }
 
 // Packs one packed-format frame (UYVY / ARGB / RGB10) into dst — already
@@ -1310,6 +1428,19 @@ static void pack_planar_frame(dlk_output *d,
     }
 }
 
+// A scheduling call the driver refused.  Once a device has gone away this
+// happens for every frame, so the log is thinned to the first failure and then
+// powers of ten — enough to establish when it started and that it never
+// stopped, without burying everything around it.
+static void note_schedule_error(dlk_output *d, HRESULT hr)
+{
+    d->last_error = (int32_t)hr;
+    int64_t n = ++d->schedule_errors;
+    if (OutputCallback::is_milestone(n))
+        dlk_logf(0, "DeckLink: ScheduleVideoFrame failed (0x%08x) — %lld so far",
+                 (unsigned)hr, (long long)n);
+}
+
 // --- genuine 16.0 zero-copy path: MallocVideoBuffer + CreateVideoFrameWithBuffer ---
 
 // Schedule mbuf as the next frame, displaying for `repeat` mode-frame periods
@@ -1333,7 +1464,7 @@ static int schedule_frame(dlk_output *d, MallocVideoBuffer *mbuf, int repeat)
         dl_frame, display_time, d->frame_duration * repeat, d->time_scale);
     dl_frame->Release();
     if (hr != S_OK) {
-        dlk_logf(0, "DeckLink: ScheduleVideoFrame failed (0x%08x)", (unsigned)hr);
+        note_schedule_error(d, hr);
         mbuf->Release();
         return 0;
     }
@@ -1344,6 +1475,7 @@ static int schedule_frame(dlk_output *d, MallocVideoBuffer *mbuf, int repeat)
     d->callback.push_inflight(mbuf);
     d->frames_in_flight++;
     d->frame_count += repeat;
+    d->scheduled++;
     return 1;
 }
 
@@ -1392,7 +1524,7 @@ static int schedule_compat_frame(dlk_output *d, IDeckLinkMutableVideoFrame *fram
     HRESULT hr = d->output.ScheduleVideoFrame(
         frame, display_time, d->frame_duration * repeat, d->time_scale);
     if (hr != S_OK) {
-        dlk_logf(0, "DeckLink: ScheduleVideoFrame failed (0x%08x)", (unsigned)hr);
+        note_schedule_error(d, hr);
         return 0;
     }
     // Unlike the v16 FIFO, pool slots are never released — they're reused in
@@ -1402,6 +1534,7 @@ static int schedule_compat_frame(dlk_output *d, IDeckLinkMutableVideoFrame *fram
     std::lock_guard<std::mutex> guard(d->lock);
     d->frames_in_flight++;
     d->frame_count += repeat;
+    d->scheduled++;
     return 1;
 }
 
@@ -1488,8 +1621,16 @@ DLK_EXPORT int dlk_output_send_audio(dlk_output *d, const int32_t *interleaved,
     HRESULT hr = d->output.ScheduleAudioSamples(
         (void *)interleaved, (uint32_t)nframes,
         ts, DLK_AUDIO_RATE, &written);
-    if (hr != S_OK)
+    if (hr != S_OK) {
+        // Same thinning as the video path: on a device that has gone away this
+        // fails once per scheduled frame, forever.
+        d->last_error = (int32_t)hr;
+        int64_t n = ++d->audio_errors;
+        if (OutputCallback::is_milestone(n))
+            dlk_logf(0, "DeckLink: ScheduleAudioSamples failed (0x%08x) — %lld so far",
+                     (unsigned)hr, (long long)n);
         return 0;
+    }
 
     int accepted = written ? (int)written : nframes;
     std::lock_guard<std::mutex> guard(d->lock);

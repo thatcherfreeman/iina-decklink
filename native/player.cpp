@@ -75,6 +75,42 @@ constexpr double kClockSnapSeconds = 0.25;
 // it, and a jump this large is audible as a discontinuity either way.
 constexpr double kAudioResyncSeconds = 0.25;
 
+// --- watchdog ---------------------------------------------------------------
+//
+// The fault this exists for: the card stops retiring scheduled frames, the
+// in-flight count pins at its limit, can_send() answers false forever, and the
+// feed loop spins on its 1 ms back-off with nothing left to say. Every other
+// counter freezes at whatever it last was, so from outside — and from the log —
+// a wedged card is indistinguishable from a paused one. Sampling the card
+// itself is the only way to tell them apart, so that is what happens here.
+
+// How often the card's own state is written to the log during normal playback.
+// At debug level, so it fills the log file (which is the record a dropout is
+// reconstructed from) without filling IINA's log window.
+constexpr auto kHeartbeat = std::chrono::seconds(5);
+
+// can_send() refusing for this long is no longer backpressure. The card's queue
+// is a handful of frames deep — a fraction of a second — so a second of refusal
+// already means something has gone wrong rather than slow.
+constexpr auto kStallSeconds = std::chrono::seconds(1);
+
+// While a stall persists, how often to say so. The first line is the one that
+// matters; these exist to record that it never cleared.
+constexpr auto kStallRepeat = std::chrono::seconds(10);
+
+// True at 1, 10, 100, ... — how the failure logs below are thinned. Once a card
+// has gone away it refuses every frame from then on, at frame rate, and a log
+// that scrolls at 60 Hz explains a fault no better than an empty one does.
+bool is_milestone(int64_t n)
+{
+    if (n <= 0)
+        return false;
+    int64_t decade = 1;
+    while (decade < n)
+        decade *= 10;
+    return decade == n;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -238,6 +274,7 @@ bool Player::start(const std::string &path, const OutputConfig &cfg, std::string
     params.fixed_height   = cfg.fixed_height;
     params.link_mode      = cfg.link_mode;
     params.force_fps      = cfg.null_fps;
+    params.stall_after    = cfg.null_stall;
 
     // The card picks the mode, so it has to be opened before the converter can
     // be told what canvas to fill.
@@ -280,6 +317,20 @@ bool Player::start(const std::string &path, const OutputConfig &cfg, std::string
     dropped_         = 0;
     repeated_        = 0;
     reseeks_         = 0;
+
+    // Left at the epoch so the first pass of the feed loop writes a heartbeat
+    // immediately: it marks where playback started, and gives every later line
+    // a healthy baseline to be compared against.
+    wd_heartbeat_    = {};
+    wd_stall_since_  = {};
+    wd_stall_logged_ = {};
+    wd_stalled_      = false;
+    wd_have_last_    = false;
+    wd_last_         = OutputHealth{};
+    send_failures_   = 0;
+    card_stalled_    = false;
+    card_playback_stopped_ = false;
+    card_late_ = card_dropped_ = card_flushed_ = card_errors_ = 0;
 
     // Audio only runs when the card actually came up with it, the source has
     // it, and the decoder managed to open it. Any of those failing leaves a
@@ -331,6 +382,16 @@ void Player::stop()
     if (feed_thread_.joinable())
         feed_thread_.join();
     running_ = false;
+
+    // The state the card was left in, recorded before it is closed. stop() runs
+    // on every reload and on teardown, so this is the line that says what the
+    // output was doing at the moment it went away — including when the reason
+    // it is being torn down is that something upstream noticed it had wedged.
+    if (output_) {
+        // Both threads are joined, so nothing else is touching the watchdog's
+        // counters and reading them here is safe.
+        log_info("player: output closing — %s", health_line(output_->health()).c_str());
+    }
 
     clear_queue();
     output_.reset();
@@ -517,9 +578,18 @@ bool Player::send_canvas(int repeat, double source_time)
     }
     // A dropped video frame advances neither axis, so its audio must not go
     // out either.
-    if (sent)
+    if (sent) {
         feed_audio(repeat, source_time);
-    return sent;
+        return true;
+    }
+
+    // Every call here is already gated on can_send(), so a refusal is not
+    // backpressure — it is the card declining a frame it said it had room for.
+    int64_t n = ++send_failures_;
+    if (is_milestone(n))
+        log_warn("player: the output refused a frame (%lld so far) — %s",
+                 (long long)n, health_line(output_->health()).c_str());
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -650,6 +720,130 @@ void Player::feed_audio(int output_frames, double source_time)
     audio_silence_ += silence;
 }
 
+// ---------------------------------------------------------------------------
+// Watchdog
+// ---------------------------------------------------------------------------
+std::string Player::health_line(const OutputHealth &h) const
+{
+    char buf[512];
+    snprintf(buf, sizeof(buf),
+             "inflight=%d/%d buffered=%d abuffered=%d stream=%.3f "
+             "sched=%lld done=%lld late=%lld carddrop=%lld flushed=%lld "
+             "schederr=%lld auderr=%lld hr=0x%08x sendfail=%lld "
+             "dropped=%lld repeated=%lld reseeks=%lld",
+             h.frames_in_flight, h.inflight_limit, h.buffered_video,
+             h.buffered_audio, h.stream_time,
+             (long long)h.scheduled, (long long)h.completed, (long long)h.late,
+             (long long)h.dropped, (long long)h.flushed,
+             (long long)h.schedule_errors, (long long)h.audio_errors,
+             (unsigned)h.last_error, (long long)send_failures_.load(),
+             (long long)dropped_.load(), (long long)repeated_.load(),
+             (long long)reseeks_.load());
+    return buf;
+}
+
+void Player::feed_watchdog(bool can_send)
+{
+    const auto now = std::chrono::steady_clock::now();
+
+    // --- stall -------------------------------------------------------------
+    if (can_send) {
+        if (wd_stalled_) {
+            double held = std::chrono::duration<double>(now - wd_stall_since_).count();
+            OutputHealth h = output_->health();
+            log_warn("player: the card started accepting frames again after %.1fs — %s",
+                     held, health_line(h).c_str());
+            wd_stalled_ = false;
+            card_stalled_ = false;
+        }
+        wd_stall_since_ = {};
+    } else {
+        if (wd_stall_since_.time_since_epoch().count() == 0)
+            wd_stall_since_ = now;
+        const bool due = !wd_stalled_ ? (now - wd_stall_since_ >= kStallSeconds)
+                                      : (now - wd_stall_logged_ >= kStallRepeat);
+        if (due) {
+            double held = std::chrono::duration<double>(now - wd_stall_since_).count();
+            OutputHealth h = output_->health();
+            // The completion counters are the whole point: if `done` here is
+            // the same number it was in the heartbeat before the stall began,
+            // the card has stopped retiring frames — which is a lost device,
+            // not backpressure — and nothing this process does will clear it.
+            log_error("player: the card has refused frames for %.1fs "
+                      "(paused=%d blackout=%d) — %s",
+                      held, clock_.paused() ? 1 : 0, blackout_.load() ? 1 : 0,
+                      health_line(h).c_str());
+            if (h.playback_stopped)
+                log_error("player: the card reports scheduled playback stopped; "
+                          "the output has to be reopened to come back");
+            wd_stalled_      = true;
+            wd_stall_logged_ = now;
+            card_stalled_    = true;
+        }
+    }
+
+    // --- heartbeat ---------------------------------------------------------
+    if (now - wd_heartbeat_ < kHeartbeat)
+        return;
+    wd_heartbeat_ = now;
+
+    OutputHealth h = output_->health();
+    card_late_             = h.late;
+    card_dropped_          = h.dropped;
+    card_flushed_          = h.flushed;
+    card_errors_           = h.schedule_errors + h.audio_errors;
+    card_playback_stopped_ = h.playback_stopped;
+
+    log_debug("player: pos=%.3f err=%+.1fms %s",
+              last_frame_time_.load(), last_error_.load() * 1000.0,
+              health_line(h).c_str());
+
+    if (!wd_have_last_) {
+        wd_have_last_ = true;
+        wd_last_ = h;
+        return;
+    }
+
+    const OutputHealth prev = wd_last_;
+    wd_last_ = h;
+
+    // Anything below is a change of state rather than a running total, so it
+    // goes out at a level IINA's log window shows too — the file has the
+    // heartbeats either way.
+    if (h.flushed > prev.flushed)
+        log_warn("player: the driver flushed %lld scheduled frame(s) — a mode, "
+                 "profile or device change underneath the output",
+                 (long long)(h.flushed - prev.flushed));
+    if (h.schedule_errors > prev.schedule_errors || h.audio_errors > prev.audio_errors)
+        log_warn("player: the card refused %lld video and %lld audio scheduling "
+                 "call(s) since the last check (last HRESULT 0x%08x)",
+                 (long long)(h.schedule_errors - prev.schedule_errors),
+                 (long long)(h.audio_errors - prev.audio_errors),
+                 (unsigned)h.last_error);
+    if (h.playback_stopped && !prev.playback_stopped)
+        log_error("player: the card stopped scheduled playback");
+
+    // Frames going out but nothing coming back is the signature of the
+    // hardware having gone away while the driver still accepts the calls.
+    if (h.scheduled > prev.scheduled && h.completed == prev.completed &&
+        h.late == prev.late && h.dropped == prev.dropped && h.flushed == prev.flushed)
+        log_error("player: %lld frames scheduled in the last %llds and not one "
+                  "completed — the card has stopped retiring frames",
+                  (long long)(h.scheduled - prev.scheduled),
+                  (long long)kHeartbeat.count());
+
+    // The hardware clock standing still says the same thing from the other
+    // direction, and catches the case the check above cannot: once the feed
+    // loop has backed off, nothing new is scheduled, so there are no
+    // completions to be missing.  Skipped while the stall report is already
+    // running, which carries the same finding every 10s.
+    if (!wd_stalled_ && h.stream_time >= 0.0 && prev.stream_time >= 0.0 &&
+        h.stream_time - prev.stream_time < 0.5 * (double)kHeartbeat.count())
+        log_error("player: the card's playback clock advanced only %.3fs in %llds "
+                  "— the hardware clock has stopped or the device is gone",
+                  h.stream_time - prev.stream_time, (long long)kHeartbeat.count());
+}
+
 // Owns one reference to a decoded frame, so the feed loop can work on it
 // outside the queue lock without a concurrent seek freeing it underneath.
 namespace {
@@ -705,7 +899,11 @@ void Player::feed_loop()
     output_->resync();
 
     while (!stopping_) {
-        if (!output_->can_send()) {
+        // Sampled once and handed to the watchdog, so what it reports is the
+        // same answer this iteration acted on.
+        const bool ready = output_->can_send();
+        feed_watchdog(ready);
+        if (!ready) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
             continue;
         }
@@ -976,5 +1174,15 @@ PlayerStatus Player::status() const
     s.audio_frames  = audio_frames_;
     s.audio_silence = audio_silence_;
     s.audio_resyncs = audio_resyncs_;
+    // Sampled by the feed loop's watchdog rather than read from the card here:
+    // stop() can free the output between this call's own checks, and a
+    // diagnostic isn't worth racing over.
+    s.stalled          = card_stalled_.load();
+    s.playback_stopped = card_playback_stopped_.load();
+    s.send_failures    = send_failures_.load();
+    s.card_late        = card_late_.load();
+    s.card_dropped     = card_dropped_.load();
+    s.card_flushed     = card_flushed_.load();
+    s.card_errors      = card_errors_.load();
     return s;
 }
