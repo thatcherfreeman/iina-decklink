@@ -56,13 +56,19 @@ const READY_TIMEOUT_MS = 2500;
 class HelperLink {
   constructor() {
     this.conn = null;
-    this.port = null;
     this.running = false;
-    this.serverStarted = false;
     this.handlers = {};
     this.attempts = 0;
     this.readyTimer = null;
-    this.launched = false;  // guards against a duplicate "ready"
+    this.launched = false;   // this session's helper has been started
+    this.connected = false;  // ...and it actually reached us
+
+    // The control server outlives any one output session — see _ensureServer.
+    this.serverPort = null;
+    this.serverReady = false;
+    this.serverPending = false;
+    this.handlersRegistered = false;
+
     // Event name → callbacks waiting for the next one, for query().
     this.waiters = {};
   }
@@ -84,7 +90,8 @@ class HelperLink {
     this.running = true;
     this.attempts = 0;
     this.launched = false;
-    this._startServer();
+    this.connected = false;
+    this._ensureServer();
     return true;
   }
 
@@ -95,41 +102,63 @@ class HelperLink {
     }
   }
 
-  _startServer() {
-    this.port = randomPort();
-    this.conn = null;
+  // One control server serves every output session for as long as the plugin
+  // is loaded.
+  //
+  // It used to be one server per session, which meant every clip called
+  // createServer() while the previous server was still live — iina.ws has no
+  // stopServer, so nothing ever closed it. IINA keeps a single
+  // WebSocketServer, so each call replaced a running one, and that swap is
+  // where this broke: intermittently the replacement never reported "ready",
+  // leaving the helper unlaunched. It is also why only the second and later
+  // sessions of an IINA run could fail — the first had no predecessor to
+  // replace — and why quitting IINA appeared to fix it.
+  //
+  // Reusing the server removes the replacement entirely. The teardown story
+  // is unchanged: there was never anything to close, and when IINA exits the
+  // socket dies with the process, which is how the helper learns to release
+  // the device.
+  _ensureServer() {
+    if (this.serverReady) {
+      this.launched = true;
+      this._launchHelper(this.serverPort);
+      return;
+    }
+    // Creation already in flight; the "ready" handler will launch.
+    if (this.serverPending) return;
 
-    // The port this attempt owns.  Read from a local rather than from
-    // this.port when the helper is finally launched, because this.port can be
+    this._registerHandlers();
+    this.serverPending = true;
+    this.serverPort = randomPort();
+
+    // The port this attempt owns. Read from a local rather than from
+    // this.serverPort when the helper is launched, because it can be
     // reassigned underneath a running handler: iina.file.write appears to let
     // queued ws callbacks in, so a state update can be delivered *during* the
-    // console.log inside the "ready" branch.  That is not hypothetical — it
-    // put a helper on a port that had been replaced microseconds earlier, and
-    // the helper sat on a socket the plugin was no longer listening to until
-    // its watchdog gave up.
-    const port = this.port;
+    // console.log in the "ready" branch. That is not hypothetical — it put a
+    // helper on a port that had been replaced microseconds earlier, and the
+    // helper sat on a socket nobody was listening to until its watchdog gave
+    // up.
+    const port = this.serverPort;
 
-    // These callbacks are registered once per server instance.  A "failed"
-    // state can arrive after startServer() returns — a port collision shows up
-    // that way rather than as a thrown error — so retrying has to happen here.
-    // Nothing launches the helper except the "ready" branch below, and that
-    // update is not guaranteed to arrive: a server has been observed binding
-    // its port successfully — the socket was there in lsof — without "ready"
-    // ever being delivered. With no timer the plugin then waits for it
-    // forever, having logged "starting output" and nothing since, which is
-    // indistinguishable from the helper itself hanging.
+    // "ready" is not guaranteed to arrive: a server has been observed binding
+    // its port — the socket was there in lsof — without ever reporting it.
+    // Without a timer the plugin waits forever, having logged "starting
+    // output" and nothing since, which looks exactly like the helper hanging.
     this._clearReadyTimer();
     this.readyTimer = setTimeout(() => {
       this.readyTimer = null;
-      if (!this.running || this.launched) return;
+      if (!this.serverPending) return;
       if (this.attempts < 2) {
         this.attempts++;
         console.warn(
           `control server never reported ready on port ${port} ` +
             `after ${READY_TIMEOUT_MS}ms; retrying on a new port`,
         );
-        this._startServer();
+        this.serverPending = false;
+        this._ensureServer();
       } else {
+        this.serverPending = false;
         this._fail(
           "The control server never came up, so the helper was never " +
             "started. Restarting IINA clears this.",
@@ -137,31 +166,56 @@ class HelperLink {
       }
     }, READY_TIMEOUT_MS);
 
+    try {
+      ws.createServer({ port });
+      ws.startServer();
+    } catch (e) {
+      this.serverPending = false;
+      this._clearReadyTimer();
+      this._fail(`Could not create the control server: ${e}`);
+    }
+  }
+
+  // Registered once for the plugin's lifetime, not once per attempt: iina.ws
+  // has no way to unregister, so re-registering per attempt just accumulated
+  // duplicates.
+  _registerHandlers() {
+    if (this.handlersRegistered) return;
+    this.handlersRegistered = true;
+
     ws.onStateUpdate((state, error) => {
       if (state === "ready") {
         this._clearReadyTimer();
-        if (this.launched) return;  // a stale handler from an earlier attempt
-        this.launched = true;
-        console.log(`control server listening on 127.0.0.1:${port}`);
-        this._launchHelper(port);
+        const port = this.serverPort;
+        if (!this.serverReady) {
+          this.serverReady = true;
+          this.serverPending = false;
+          console.log(`control server listening on 127.0.0.1:${port}`);
+        }
+        // A session may have been stopped while the server was coming up.
+        if (this.running && !this.launched) {
+          this.launched = true;
+          this._launchHelper(port);
+        }
       } else if (state === "failed" || state === "cancelled") {
-        this._clearReadyTimer();
         const message = error ? error.message : state;
-        // Once a server has gone ready and the helper is on its way, a
-        // cancellation is almost always this attempt's *predecessor* being
-        // torn down — creating another server here starts a chain of
-        // replacements that ends with the helper talking to a port nobody is
-        // listening on.  A real loss of the live server surfaces instead as
-        // the helper exiting, which onExit already handles.
-        if (this.launched) {
-          console.log(`control server ${state} (${message}) after launch; ignoring`);
+        if (this.serverReady) {
+          // The live server went away. Nothing to retry here — the session
+          // ends via the helper exiting, which onExit handles — but the next
+          // start() has to build a new one rather than trust this port.
+          console.log(`control server ${state} (${message}); will rebuild on next start`);
+          this.serverReady = false;
+          this.serverPort = null;
           return;
         }
-        if (this.running && this.attempts < 5) {
+        this._clearReadyTimer();
+        if (this.attempts < 5) {
           this.attempts++;
           console.log(`control server ${state} (${message}); retrying on a new port`);
-          this._startServer();
-        } else if (this.running) {
+          this.serverPending = false;
+          this._ensureServer();
+        } else {
+          this.serverPending = false;
           this._fail(`Could not open a control port for the helper: ${message}`);
         }
       }
@@ -170,6 +224,7 @@ class HelperLink {
     ws.onNewConnection((conn) => {
       console.log(`helper connected (${conn})`);
       this.conn = conn;
+      this.connected = true;
       if (this.handlers.onConnect) this.handlers.onConnect();
     });
 
@@ -195,14 +250,6 @@ class HelperLink {
       }
       if (this.handlers.onEvent) this.handlers.onEvent(obj);
     });
-
-    try {
-      ws.createServer({ port: this.port });
-      ws.startServer();
-      this.serverStarted = true;
-    } catch (e) {
-      this._fail(`Could not create the control server: ${e}`);
-    }
   }
 
   _launchHelper(port) {
@@ -235,8 +282,22 @@ class HelperLink {
       )
       .then((result) => {
         this.conn = null;
+        // A helper that ran but never reached us means the port we are holding
+        // is not actually reachable, whatever state the server reported. Don't
+        // hand the next session the same dead port — rebuild instead. This is
+        // the failure that stranded a helper on a replaced port until its
+        // watchdog released the device.
+        if (!this.connected) {
+          console.warn(
+            `helper never connected on port ${port}; rebuilding the control ` +
+              `server for the next start`,
+          );
+          this.serverReady = false;
+          this.serverPort = null;
+        }
         const wasRunning = this.running;
         this.running = false;
+        this.launched = false;
         if (this.handlers.onExit) this.handlers.onExit(result.status, wasRunning);
       })
       .catch((e) => {
@@ -298,6 +359,9 @@ class HelperLink {
   // Asks the helper to quit, then drops the connection.  Either is enough on
   // its own — the helper exits when the socket closes — but the explicit quit
   // releases the card a beat sooner.
+  // Ends the output session. The control server deliberately stays up: iina.ws
+  // cannot close it anyway, and reusing it is what keeps the next start() from
+  // replacing a live server.
   stop() {
     if (this.conn) this.send({ cmd: "quit" });
     this._clearReadyTimer();
