@@ -47,9 +47,11 @@ function findHelper(settings) {
 const QUERY_TIMEOUT_MS = 4000;
 
 // How long to wait for the control server to report itself ready before
-// treating it as wedged. Binding a loopback port is immediate, so this only
-// has to be longer than a slow main thread, not longer than any real work.
-const READY_TIMEOUT_MS = 5000;
+// treating it as wedged. Binding a loopback port is immediate — the update
+// has been observed arriving 2 ms after createServer — so this only has to be
+// longer than a slow main thread, and every second of it is a second of black
+// output when the first attempt is the one that goes missing.
+const READY_TIMEOUT_MS = 2500;
 
 class HelperLink {
   constructor() {
@@ -97,6 +99,16 @@ class HelperLink {
     this.port = randomPort();
     this.conn = null;
 
+    // The port this attempt owns.  Read from a local rather than from
+    // this.port when the helper is finally launched, because this.port can be
+    // reassigned underneath a running handler: iina.file.write appears to let
+    // queued ws callbacks in, so a state update can be delivered *during* the
+    // console.log inside the "ready" branch.  That is not hypothetical — it
+    // put a helper on a port that had been replaced microseconds earlier, and
+    // the helper sat on a socket the plugin was no longer listening to until
+    // its watchdog gave up.
+    const port = this.port;
+
     // These callbacks are registered once per server instance.  A "failed"
     // state can arrive after startServer() returns — a port collision shows up
     // that way rather than as a thrown error — so retrying has to happen here.
@@ -113,7 +125,7 @@ class HelperLink {
       if (this.attempts < 2) {
         this.attempts++;
         console.warn(
-          `control server never reported ready on port ${this.port} ` +
+          `control server never reported ready on port ${port} ` +
             `after ${READY_TIMEOUT_MS}ms; retrying on a new port`,
         );
         this._startServer();
@@ -130,11 +142,21 @@ class HelperLink {
         this._clearReadyTimer();
         if (this.launched) return;  // a stale handler from an earlier attempt
         this.launched = true;
-        console.log(`control server listening on 127.0.0.1:${this.port}`);
-        this._launchHelper();
+        console.log(`control server listening on 127.0.0.1:${port}`);
+        this._launchHelper(port);
       } else if (state === "failed" || state === "cancelled") {
         this._clearReadyTimer();
         const message = error ? error.message : state;
+        // Once a server has gone ready and the helper is on its way, a
+        // cancellation is almost always this attempt's *predecessor* being
+        // torn down — creating another server here starts a chain of
+        // replacements that ends with the helper talking to a port nobody is
+        // listening on.  A real loss of the live server surfaces instead as
+        // the helper exiting, which onExit already handles.
+        if (this.launched) {
+          console.log(`control server ${state} (${message}) after launch; ignoring`);
+          return;
+        }
         if (this.running && this.attempts < 5) {
           this.attempts++;
           console.log(`control server ${state} (${message}); retrying on a new port`);
@@ -183,8 +205,8 @@ class HelperLink {
     }
   }
 
-  _launchHelper() {
-    const url = `ws://127.0.0.1:${this.port}/`;
+  _launchHelper(port) {
+    const url = `ws://127.0.0.1:${port}/`;
     // The helper keeps its own log, rather than relying on the lines it sends
     // back over stderr. Those land in IINA's Log Viewer, which is in-memory and
     // per-session — gone by the time anyone notices the output dropped out —
