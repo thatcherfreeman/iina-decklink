@@ -46,6 +46,11 @@ function findHelper(settings) {
 // enumeration call.
 const QUERY_TIMEOUT_MS = 4000;
 
+// How long to wait for the control server to report itself ready before
+// treating it as wedged. Binding a loopback port is immediate, so this only
+// has to be longer than a slow main thread, not longer than any real work.
+const READY_TIMEOUT_MS = 5000;
+
 class HelperLink {
   constructor() {
     this.conn = null;
@@ -54,6 +59,8 @@ class HelperLink {
     this.serverStarted = false;
     this.handlers = {};
     this.attempts = 0;
+    this.readyTimer = null;
+    this.launched = false;  // guards against a duplicate "ready"
     // Event name → callbacks waiting for the next one, for query().
     this.waiters = {};
   }
@@ -74,8 +81,16 @@ class HelperLink {
     this.helper = helper;
     this.running = true;
     this.attempts = 0;
+    this.launched = false;
     this._startServer();
     return true;
+  }
+
+  _clearReadyTimer() {
+    if (this.readyTimer) {
+      clearTimeout(this.readyTimer);
+      this.readyTimer = null;
+    }
   }
 
   _startServer() {
@@ -85,11 +100,40 @@ class HelperLink {
     // These callbacks are registered once per server instance.  A "failed"
     // state can arrive after startServer() returns — a port collision shows up
     // that way rather than as a thrown error — so retrying has to happen here.
+    // Nothing launches the helper except the "ready" branch below, and that
+    // update is not guaranteed to arrive: a server has been observed binding
+    // its port successfully — the socket was there in lsof — without "ready"
+    // ever being delivered. With no timer the plugin then waits for it
+    // forever, having logged "starting output" and nothing since, which is
+    // indistinguishable from the helper itself hanging.
+    this._clearReadyTimer();
+    this.readyTimer = setTimeout(() => {
+      this.readyTimer = null;
+      if (!this.running || this.launched) return;
+      if (this.attempts < 2) {
+        this.attempts++;
+        console.warn(
+          `control server never reported ready on port ${this.port} ` +
+            `after ${READY_TIMEOUT_MS}ms; retrying on a new port`,
+        );
+        this._startServer();
+      } else {
+        this._fail(
+          "The control server never came up, so the helper was never " +
+            "started. Restarting IINA clears this.",
+        );
+      }
+    }, READY_TIMEOUT_MS);
+
     ws.onStateUpdate((state, error) => {
       if (state === "ready") {
+        this._clearReadyTimer();
+        if (this.launched) return;  // a stale handler from an earlier attempt
+        this.launched = true;
         console.log(`control server listening on 127.0.0.1:${this.port}`);
         this._launchHelper();
       } else if (state === "failed" || state === "cancelled") {
+        this._clearReadyTimer();
         const message = error ? error.message : state;
         if (this.running && this.attempts < 5) {
           this.attempts++;
@@ -234,7 +278,9 @@ class HelperLink {
   // releases the card a beat sooner.
   stop() {
     if (this.conn) this.send({ cmd: "quit" });
+    this._clearReadyTimer();
     this.running = false;
+    this.launched = false;
     this.conn = null;
   }
 }
