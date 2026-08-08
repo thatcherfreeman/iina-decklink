@@ -1,7 +1,7 @@
 {
   "name": "DeckLink Output",
   "identifier": "com.thatcherfreeman.iina-decklink",
-  "version": "0.3.0",
+  "version": "0.4.1",
   "description": "Sends a clean feed of the playing video to a Blackmagic DeckLink or UltraStudio device, for viewing on a reference monitor. Code values are rescaled and repacked but never colour-converted.",
   "author": {
     "name": "Thatcher Freeman",
